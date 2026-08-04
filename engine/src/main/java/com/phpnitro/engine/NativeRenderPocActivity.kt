@@ -78,11 +78,35 @@ class NativeRenderPocActivity : AppCompatActivity() {
     private lateinit var canvasView: NativeCanvasView
     private lateinit var rootLayout: FrameLayout
     private var serverPort: Int = 0
+    // "127.0.0.1" (embedded PhpServer, the default) unless a "serverHost"
+    // intent extra says otherwise — see onCreate()'s remote-mode branch.
+    // PhpNitro Go (android/go/) is the only caller that ever sets this: a
+    // companion app with no bundled project code at all, that talks to a
+    // `phpx serve` dev server over the LAN instead of an embedded php-cli
+    // process, reusing this exact same rendering pipeline unmodified.
+    private var serverHost: String = "127.0.0.1"
     private val screenStack = mutableListOf<String>()
     private val fieldValues = mutableMapOf<String, String>()
     private var activeEditText: EditText? = null
     private val deviceBridge by lazy { NativeDeviceBridge(this) }
     private var firstScreenRendered = false
+    // Built lazily the first time a fetch fails outright (server
+    // unreachable, wrong network, dev server not running) — before this,
+    // that failure just left the splash screen up forever with zero
+    // feedback (splash's keepOnScreenCondition never saw
+    // firstScreenRendered flip true), which is what an all-black screen
+    // actually was: not a rendering bug, an invisible failure.
+    private var connectionErrorView: android.view.View? = null
+    private var connectionErrorMessage: TextView? = null
+    // Which OAuthProvider (see NativeDeviceBridge.signInWithGoogle()'s
+    // sibling startOAuthFlow()) currently has a Custom Tab open — read by
+    // handleOAuthCallback() once the redirect lands back in onNewIntent().
+    private var pendingOAuthProvider: String? = null
+    // ConfettiView overlay — see showConfettiOverlay(). Tracked so a
+    // second burst (another render with confetti:true, or a manual
+    // replay tap) before the first one finishes tears down the old view
+    // instead of stacking a second one on top of it.
+    private var activeConfettiView: ConfettiView? = null
     // Canvas::stableHash() of the last response actually applied —
     // sent back as lastHash= on the next same-screen refetch so PHP can
     // reply {"unchanged":true} instead of the whole payload when nothing
@@ -203,12 +227,26 @@ class NativeRenderPocActivity : AppCompatActivity() {
 
         nfcAdapter = android.nfc.NfcAdapter.getDefaultAdapter(this)
 
-        phpServer = PhpServer(this)
-        thread {
-            val port = phpServer.start()
-            serverPort = port
-            Log.i(TAG, "PhpServer started on port $port")
+        val remoteHost = intent.getStringExtra("serverHost")
+        if (remoteHost != null) {
+            // Remote mode (PhpNitro Go): the dev server already exists
+            // somewhere else on the LAN — no local php-cli process to
+            // start at all. serverPort is set directly (normally
+            // PhpServer.start()'s return value does this once the
+            // embedded server is actually listening) so the splash
+            // screen's `serverPort == 0` gate still resolves correctly.
+            serverHost = remoteHost
+            serverPort = intent.getIntExtra("serverPort", 0)
+            Log.i(TAG, "Remote mode: $serverHost:$serverPort")
             refetch(action = null, isNavigation = true)
+        } else {
+            phpServer = PhpServer(this)
+            thread {
+                val port = phpServer.start()
+                serverPort = port
+                Log.i(TAG, "PhpServer started on port $port")
+                refetch(action = null, isNavigation = true)
+            }
         }
     }
 
@@ -260,6 +298,33 @@ class NativeRenderPocActivity : AppCompatActivity() {
                 deviceBridge.translateText(text, "fr", targetLanguage) { translated ->
                     fieldValues["translate_out"] = translated
                     refetch(action = null, includeFields = true)
+                }
+            }
+            // GitHub/Facebook/Microsoft/Apple — public/index.php already
+            // built the full authorize URL (client_id, scope, state)
+            // server-side via {Provider}SignIn::authorizeUrl(); this side
+            // never sees a client secret. pendingOAuthProvider is what
+            // lets handleOAuthCallback() (onNewIntent()) know which
+            // "oauth_callback:" action to fire once the redirect lands —
+            // only one OAuth flow can realistically be in flight at a
+            // time (the Custom Tab has focus), so a single field is
+            // enough, no need for a map.
+            action.startsWith("oauth:") -> {
+                val provider = action.removePrefix("oauth:")
+                val authorizeUrl = meta?.optString("url")
+                if (authorizeUrl.isNullOrEmpty()) {
+                    // public/index.php only omits "url" from this
+                    // button's meta when that provider's client_id/secret
+                    // aren't configured in .env — same "fail
+                    // informatively before opening anything" pre-flight
+                    // check googlesignin's webClientId.isBlank() does,
+                    // just decided server-side instead of via a string
+                    // resource, since the client_id itself lives there.
+                    fieldValues["oauth_error"] = "Connexion $provider non configurée (client_id manquant côté serveur)."
+                    refetch(action = null, includeFields = true)
+                } else {
+                    pendingOAuthProvider = provider
+                    deviceBridge.startOAuthFlow(authorizeUrl)
                 }
             }
             action.startsWith("select:") -> showSelectDialog(action.removePrefix("select:"), meta)
@@ -564,10 +629,16 @@ class NativeRenderPocActivity : AppCompatActivity() {
                 fieldValues[parts.getOrElse(1) { "calendar_out" }] = if (count < 0) "Permission requise" else "$count événements"
                 refetch(action = null, includeFields = true)
             }
-            "sound" -> deviceBridge.playSound("http://127.0.0.1:$serverPort/assets/audio/beep.wav")
+            "sound" -> deviceBridge.playSound("http://$serverHost:$serverPort/assets/audio/beep.wav")
             "notify" -> deviceBridge.showNotification("PhpNitro", "Ceci est une notification native.")
             "share" -> deviceBridge.share("Regarde cette app faite avec PhpNitro !", "PhpNitro Demo")
             "appicon" -> deviceBridge.setAppIcon(parts.getOrElse(1) { "default" })
+            // Manual "🎉 encore" replay button — Confetti::triggerAction().
+            // The automatic case (Canvas::triggerConfetti(), a widget
+            // dropped in the tree) is handled in setCommands() instead,
+            // since that one has to fire on every matching render, not
+            // just a tap.
+            "confetti" -> showConfettiOverlay()
             "brightness" -> deviceBridge.setBrightness(0.5f)
             "locate" -> {
                 deviceBridge.getLocation { result ->
@@ -589,6 +660,17 @@ class NativeRenderPocActivity : AppCompatActivity() {
             }
             "camera" -> takePicturePreview.launch(null)
             "pickimage" -> pickImage.launch("image/*")
+            "googlesignin" -> {
+                val webClientId = getString(R.string.google_web_client_id)
+                deviceBridge.signInWithGoogle(webClientId) { idToken, error ->
+                    if (idToken != null) {
+                        fieldValues["google_id_token"] = idToken
+                    } else {
+                        fieldValues["google_signin_error"] = error ?: "Échec de connexion Google."
+                    }
+                    refetch("google_signin", includeFields = true)
+                }
+            }
             "sensor" -> {
                 deviceBridge.readSensor(android.hardware.Sensor.TYPE_ACCELEROMETER) { result ->
                     fieldValues[parts.getOrElse(1) { "sensor_out" }] = result
@@ -647,10 +729,33 @@ class NativeRenderPocActivity : AppCompatActivity() {
                 multiline -> InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE
                 else -> InputType.TYPE_CLASS_TEXT
             }
-            if (multiline) {
-                gravity = android.view.Gravity.TOP or android.view.Gravity.START
+            gravity = if (multiline) {
+                android.view.Gravity.TOP or android.view.Gravity.START
+            } else {
+                android.view.Gravity.CENTER_VERTICAL or android.view.Gravity.START
             }
             textSize = 15f
+            setTextColor(android.graphics.Color.parseColor("#111827")) // Tokens::ink()
+            // The default EditText style is just an underline over a
+            // transparent background (Material's own colorAccent, which
+            // is why a stock green line appeared on focus on this
+            // device) — with no opaque fill of its own, this EditText
+            // sat on top of the Canvas box TextField.php already
+            // painted underneath (background + placeholder text baked
+            // into that one static draw command), so the stale
+            // placeholder kept showing through around/behind whatever
+            // was actually typed. A solid white rounded rect matching
+            // that same Container's own styling (Tokens::surface() +
+            // RADIUS_MD + border(), values duplicated here the same way
+            // this file already hardcodes brand colors elsewhere) fully
+            // covers it instead of just hiding the underline.
+            background = android.graphics.drawable.GradientDrawable().apply {
+                setColor(android.graphics.Color.WHITE)
+                cornerRadius = 14f * density
+                setStroke((1 * density).toInt(), android.graphics.Color.parseColor("#E5E7EB"))
+            }
+            val paddingH = (12 * density).toInt()
+            setPadding(paddingH, paddingTop, paddingH, paddingBottom)
             addTextChangedListener(object : TextWatcher {
                 override fun afterTextChanged(s: Editable?) {
                     fieldValues[fieldName] = s?.toString() ?: ""
@@ -760,6 +865,30 @@ class NativeRenderPocActivity : AppCompatActivity() {
             rootLayout.removeView(it)
         }
         activeVideoView = null
+    }
+
+    // See ConfettiView's own docblock for the actual particle simulation
+    // — this is just the overlay lifecycle (add, start, remove itself
+    // after its own duration), the same shape every other full-screen/
+    // full-rect overlay here (video, map) already follows, just with a
+    // timed self-removal instead of clearVideoOverlay()/clearMapOverlay()
+    // needing an explicit caller.
+    private fun showConfettiOverlay() {
+        activeConfettiView?.let { rootLayout.removeView(it) }
+
+        val durationMs = 3000L
+        val confettiView = ConfettiView(this)
+        rootLayout.addView(confettiView, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+        confettiView.start(durationMs = durationMs)
+        activeConfettiView = confettiView
+
+        Handler(Looper.getMainLooper()).postDelayed({
+            confettiView.stop()
+            if (activeConfettiView === confettiView) {
+                rootLayout.removeView(confettiView)
+                activeConfettiView = null
+            }
+        }, durationMs)
     }
 
     // A real, pannable/zoomable org.osmdroid.views.MapView (pinch-zoom is
@@ -942,7 +1071,7 @@ class NativeRenderPocActivity : AppCompatActivity() {
         // "network/parse overhead" instead of one opaque total.
         val startNanos = System.nanoTime()
         try {
-            val connection = URL("http://127.0.0.1:$port/native/layout-demo?width=$screenWidthDp&height=$screenHeightDp&screen=$screen$idParam$actionParam$onlineParam$scrollYParam$fieldsParam$lastHashParam").openConnection() as HttpURLConnection
+            val connection = URL("http://$serverHost:$port/native/layout-demo?width=$screenWidthDp&height=$screenHeightDp&screen=$screen$idParam$actionParam$onlineParam$scrollYParam$fieldsParam$lastHashParam").openConnection() as HttpURLConnection
             connection.connectTimeout = 5000
             Log.i(TAG, "Fetching /native/layout-demo (screen=$screen, action=$action), response code ${connection.responseCode}")
             val json = connection.inputStream.bufferedReader().use { it.readText() }
@@ -956,7 +1085,102 @@ class NativeRenderPocActivity : AppCompatActivity() {
             Handler(Looper.getMainLooper()).post { applyResponse(json, screenWidthDp, isNavigation) }
         } catch (e: Exception) {
             Log.e(TAG, "Failed to fetch draw commands", e)
+            Handler(Looper.getMainLooper()).post { showConnectionError() }
         }
+    }
+
+    // Only ever reached after a fetch failure — see fetchDrawCommands()'s
+    // catch block. Reuses ConnectActivity's plain-Views style (this class
+    // has no XML layouts at all) rather than adding a layout file for one
+    // screen. Idempotent: repeated failures (e.g. an auto-retry poll)
+    // just update the existing view's text instead of stacking duplicates.
+    private fun showConnectionError() {
+        firstScreenRendered = true // dismiss the splash — see its keepOnScreenCondition above
+
+        val target = "$serverHost:$serverPort"
+        val existing = connectionErrorView
+        if (existing != null) {
+            connectionErrorMessage?.text = target
+            existing.visibility = android.view.View.VISIBLE
+            return
+        }
+
+        val density = resources.displayMetrics.density
+        fun dp(value: Int) = (value * density).toInt()
+        val accent = android.graphics.Color.parseColor("#F97316") // same accent NativeCanvasView's own dev-tools badge/panel already use
+
+        val icon = TextView(this).apply {
+            text = "📡"
+            textSize = 30f
+            gravity = Gravity.CENTER
+            background = android.graphics.drawable.GradientDrawable().apply {
+                shape = android.graphics.drawable.GradientDrawable.OVAL
+                setColor(android.graphics.Color.parseColor("#332D3748"))
+            }
+        }
+        val title = TextView(this).apply {
+            text = "Connexion impossible"
+            textSize = 18f
+            setTypeface(typeface, Typeface.BOLD)
+            setTextColor(android.graphics.Color.WHITE)
+            gravity = Gravity.CENTER
+            setPadding(0, dp(18), 0, dp(6))
+        }
+        val targetLabel = TextView(this).apply {
+            text = target
+            typeface = Typeface.MONOSPACE
+            textSize = 13f
+            setTextColor(accent)
+            gravity = Gravity.CENTER
+            setPadding(0, 0, 0, dp(14))
+        }
+        connectionErrorMessage = targetLabel
+        val hint = TextView(this).apply {
+            text = "Vérifie que cet appareil est sur le même réseau Wi-Fi que la machine de dev, et que `phpx serve` tourne toujours."
+            textSize = 14f
+            setTextColor(android.graphics.Color.parseColor("#9CA3AF"))
+            gravity = Gravity.CENTER
+        }
+        val retryButton = TextView(this).apply {
+            text = "Réessayer"
+            textSize = 15f
+            setTypeface(typeface, Typeface.BOLD)
+            setTextColor(android.graphics.Color.WHITE)
+            gravity = Gravity.CENTER
+            setPadding(dp(24), dp(12), dp(24), dp(12))
+            background = android.graphics.drawable.GradientDrawable().apply {
+                setColor(accent)
+                cornerRadius = dp(24).toFloat()
+            }
+            isClickable = true
+            setOnClickListener {
+                connectionErrorView?.visibility = android.view.View.GONE
+                refetch(action = null, isNavigation = true)
+            }
+        }
+        val card = android.widget.LinearLayout(this).apply {
+            orientation = android.widget.LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_HORIZONTAL
+            setPadding(dp(28), dp(28), dp(28), dp(28))
+            background = android.graphics.drawable.GradientDrawable().apply {
+                setColor(android.graphics.Color.parseColor("#EE111827"))
+                cornerRadius = dp(18).toFloat()
+            }
+            addView(icon, android.widget.LinearLayout.LayoutParams(dp(56), dp(56)))
+            addView(title)
+            addView(targetLabel)
+            addView(hint)
+            addView(retryButton, android.widget.LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                topMargin = dp(22)
+            })
+        }
+        val params = FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+            gravity = Gravity.CENTER
+            leftMargin = dp(32)
+            rightMargin = dp(32)
+        }
+        rootLayout.addView(card, params)
+        connectionErrorView = card
     }
 
     // A "redirect" field means PHP wants the client on a different screen
@@ -965,6 +1189,7 @@ class NativeRenderPocActivity : AppCompatActivity() {
     // handling). Swap the stack's top entry and re-fetch instead of
     // drawing the stale response.
     private fun applyResponse(json: String, screenWidthDp: Float, isNavigation: Boolean) {
+        connectionErrorView?.visibility = android.view.View.GONE
         if (isNavigation) lastAppliedHash = null
 
         // {"unchanged":true} — PHP determined its output would be byte-
@@ -987,6 +1212,15 @@ class NativeRenderPocActivity : AppCompatActivity() {
         syncLottieOverlays(canvasView.lottieRegions)
         firstScreenRendered = true
         scheduleTimedRefetch(json)
+        // Canvas::triggerConfetti() (Confetti, dropped anywhere in the
+        // tree) — fires automatically on whatever render included it, no
+        // tap needed. Same raw-string regex check scheduleTimedRefetch()
+        // just did above for autoNavigate/pollAgain, not a JSONObject
+        // parse — this method already has the raw response string, no
+        // need to parse it twice.
+        if (json.contains("\"confetti\":true")) {
+            showConfettiOverlay()
+        }
         lastAppliedHash = Regex("\"hash\":\"([0-9a-f]+)\"").find(json)?.groupValues?.get(1)
         if (devToolsPanel != null) updateDevToolsPanel(screenStack.lastOrNull() ?: "?", wasUnchanged = false)
     }
@@ -1060,6 +1294,10 @@ class NativeRenderPocActivity : AppCompatActivity() {
         super.onNewIntent(intent)
         setIntent(intent)
 
+        if (handleOAuthCallback(intent)) {
+            return
+        }
+
         if (handleNfcIntent(intent)) {
             return
         }
@@ -1068,6 +1306,37 @@ class NativeRenderPocActivity : AppCompatActivity() {
         clearTextInput()
         screenStack.add(screen)
         refetch(action = null, isNavigation = true)
+    }
+
+    // phpnitro://oauth-callback?code=...&state=... (or &error=...) — see
+    // AndroidManifest.xml's matching intent-filter and NativeDeviceBridge's
+    // startOAuthFlow(). state travels back to PHP verbatim; PHP is the one
+    // that actually verifies it against what it stored in $_SESSION when
+    // it built the authorize URL (see public/index.php's "oauth_callback:"
+    // handling) — this method doesn't validate anything itself, it's pure
+    // transport, same "PHP decides, Kotlin just reports" split as every
+    // other capability here.
+    private fun handleOAuthCallback(intent: Intent): Boolean {
+        val uri = intent.data ?: return false
+        if (uri.scheme != "phpnitro" || uri.host != "oauth-callback") return false
+
+        val provider = pendingOAuthProvider
+        pendingOAuthProvider = null
+        if (provider == null) {
+            Log.e(TAG, "oauth-callback received with no pending provider")
+            return true
+        }
+
+        val code = uri.getQueryParameter("code")
+        if (code != null) {
+            fieldValues["oauth_code"] = code
+            fieldValues["oauth_state"] = uri.getQueryParameter("state") ?: ""
+            refetch("oauth_callback:$provider", includeFields = true)
+        } else {
+            fieldValues["oauth_error"] = uri.getQueryParameter("error") ?: "Connexion annulée."
+            refetch(action = null, includeFields = true)
+        }
+        return true
     }
 
     // Same tag-reading logic as MainActivity.handleNfcIntent() — an NDEF
@@ -1143,7 +1412,9 @@ class NativeRenderPocActivity : AppCompatActivity() {
 
     override fun onDestroy() {
         autoNavigateHandler.removeCallbacksAndMessages(null)
-        phpServer.stop()
+        // Remote mode never constructs phpServer at all (see onCreate()) —
+        // ::phpServer.isInitialized guards against UninitializedPropertyAccessException.
+        if (::phpServer.isInitialized) phpServer.stop()
         super.onDestroy()
     }
 }
