@@ -61,7 +61,35 @@
                 <category android:name="android.intent.category.BROWSABLE" />
                 <data android:scheme="phpnitro" android:host="oauth-callback" />
             </intent-filter>
+            <!-- General deep link: phpnitro://product/42 -> screenStack
+                 token "product/42" (see deepLinkScreenToken() in
+                 NativeRenderPocActivity.kt) -> the exact same "name/param"
+                 shape fetchDrawCommands() already splits for an in-app
+                 navigate:product/42. A separate filter (not the
+                 oauth-callback one above) since that one is pinned to a
+                 single host; deepLinkScreenToken() itself excludes
+                 host="oauth-callback" so the two never race on the same
+                 URI. Scheme-only, no android:host, matches any host —
+                 same "no verified domain available in this environment"
+                 tradeoff MainActivity's own deep link takes. -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="phpnitro" />
+            </intent-filter>
         </activity>
+
+        <!-- adb-only proof of concept — see RustRenderPocActivity.kt's own
+             docblock for why this is a separate activity/file rather than
+             a change to NativeCanvasView.kt or NativeRenderPocActivity
+             above. No intent-filter beyond the implicit default: this is
+             never a consuming app's launcher, only ever reached via
+             `adb shell am start -n <package>/com.phpnitro.engine.RustRenderPocActivity`. -->
+        <activity
+            android:name=".RustRenderPocActivity"
+            android:theme="@style/Theme.App.Starting"
+            android:exported="true" />
 
         <receiver android:name=".AlarmReceiver" android:exported="false" />
         <receiver android:name=".GeofenceReceiver" android:exported="false" />
@@ -69,5 +97,39 @@
              broadcast -n` can still target it explicitly on a debuggable
              build. See HotReloadReceiver.kt. -->
         <receiver android:name=".HotReloadReceiver" android:exported="false" />
+
+        <!-- Engine\Device\WebSocket — a real persistent connection that
+             survives this app being backgrounded, which Android only
+             allows from a declared foreground service (not a plain
+             Activity-owned background thread). android:foregroundServiceType
+             ="dataSync" is mandatory from API 34 and must match one of the
+             OS's fixed categories — a live network connection is data
+             sync, not media/location/camera/etc. See WebSocketService.kt's
+             own docblock and android/app's manifest for the matching
+             FOREGROUND_SERVICE/FOREGROUND_SERVICE_DATA_SYNC permissions
+             (declared there, not here, same "capability-specific
+             permission belongs to the consuming app" split every other
+             optional capability already takes). -->
+        <service
+            android:name=".WebSocketService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
+
+        <!-- Engine\Device\OpenFile — a content:// Uri is the only way to
+             hand another app (whatever resolves the file's MIME type) a
+             file living in this app's own storage; a raw file:// path is
+             rejected across app boundaries since API 24. ${applicationId}
+             resolves to the consuming app's own package at merge time, so
+             this authority never collides between two PhpNitro apps
+             installed side by side on the same device. -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
     </application>
 </manifest>

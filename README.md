@@ -24,7 +24,7 @@ dependencyResolutionManagement {
 ```kotlin
 // app/build.gradle.kts
 dependencies {
-    implementation("com.github.phpnitro:android-engine:v1.2.0")
+    implementation("com.github.phpnitro:android-engine:v1.3.0")
 }
 ```
 

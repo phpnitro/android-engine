@@ -252,28 +252,50 @@ class NativeDeviceBridge(private val context: Context) {
     }
 
     /**
-     * Toggles between the "default" and "alt" launcher-icon aliases, same
-     * PackageManager.setComponentEnabledSetting dance as
-     * WebAppInterface.setAppIcon() — the two aliases already exist in the
-     * manifest for the WebView path, and an icon isn't path-specific
-     * either.
+     * Enables the activity-alias matching $iconKey and disables every
+     * OTHER activity-alias that follows the same ".DynamicIcon<Key>"
+     * naming convention (Engine\Device\DynamicIcon, see its own
+     * docblock) — discovered via PackageManager
+     * (GET_ACTIVITIES|MATCH_DISABLED_COMPONENTS also returns
+     * activity-aliases, not just real activities), not a hardcoded
+     * two-alias list. A project isn't capped at exactly two icons: add
+     * another ".DynamicIcon<Key>" alias to AndroidManifest.xml (its own
+     * icon/roundIcon, same shape as the two already there) and this
+     * function picks it up with no code change here — the one thing
+     * that genuinely can't be dynamic is the icon FILES themselves
+     * (real OS constraint: every launcher-icon variant an app can ever
+     * switch to must be declared, and its APK size paid for, at build
+     * time — no framework can materialize a brand new icon file at
+     * runtime).
+     *
+     * $iconKey is snake_case/kebab-case ("holiday_2026") converted to
+     * the alias's PascalCase suffix (".DynamicIconHoliday2026") —
+     * matches DynamicIcon::setAction()'s own PHP-side key convention.
      */
     fun setAppIcon(iconKey: String) {
         val packageManager = context.packageManager
-        val defaultAlias = ComponentName(context, "${context.packageName}.MainActivityDefault")
-        val altAlias = ComponentName(context, "${context.packageName}.MainActivityAlt")
-        val (enable, disable) = if (iconKey == "alt") altAlias to defaultAlias else defaultAlias to altAlias
+        val aliasSuffix = iconKey.split("_", "-")
+            .filter { it.isNotEmpty() }
+            .joinToString("") { it.replaceFirstChar(Char::uppercaseChar) }
+        val targetAlias = "${context.packageName}.DynamicIcon$aliasSuffix"
 
-        packageManager.setComponentEnabledSetting(
-            enable,
-            PackageManager.COMPONENT_ENABLED_STATE_ENABLED,
-            PackageManager.DONT_KILL_APP,
+        val packageInfo = packageManager.getPackageInfo(
+            context.packageName,
+            PackageManager.GET_ACTIVITIES or PackageManager.MATCH_DISABLED_COMPONENTS,
         )
-        packageManager.setComponentEnabledSetting(
-            disable,
-            PackageManager.COMPONENT_ENABLED_STATE_DISABLED,
-            PackageManager.DONT_KILL_APP,
-        )
+        val knownAliases = packageInfo.activities
+            ?.map { it.name }
+            ?.filter { it.contains(".DynamicIcon") }
+            ?: emptyList()
+
+        for (aliasName in knownAliases) {
+            val state = if (aliasName == targetAlias) {
+                PackageManager.COMPONENT_ENABLED_STATE_ENABLED
+            } else {
+                PackageManager.COMPONENT_ENABLED_STATE_DISABLED
+            }
+            packageManager.setComponentEnabledSetting(ComponentName(context, aliasName), state, PackageManager.DONT_KILL_APP)
+        }
     }
 
     /**
@@ -675,6 +697,33 @@ class NativeDeviceBridge(private val context: Context) {
 
     fun cancelBackgroundTask() {
         androidx.work.WorkManager.getInstance(context).cancelUniqueWork("phpx_background_ping")
+    }
+
+    /**
+     * Same AlarmReceiver WebAppInterface.scheduleAlarm() already uses —
+     * genuinely shared (fires a notification even if this app's process
+     * has since been killed, whichever rendering path scheduled it).
+     * setExactAndAllowWhileIdle so it still fires under Doze, at the cost
+     * of needing the (normal, no runtime prompt) SCHEDULE_EXACT_ALARM +
+     * USE_EXACT_ALARM permissions on API 31+ — already declared in
+     * android/app/src/main/AndroidManifest.xml.
+     */
+    fun scheduleAlarm(requestCode: Int, delaySeconds: Int, title: String, message: String) {
+        val alarmManager = context.getSystemService(Context.ALARM_SERVICE) as android.app.AlarmManager
+        val intent = Intent(context, AlarmReceiver::class.java).apply {
+            putExtra("title", title)
+            putExtra("message", message)
+            putExtra("requestCode", requestCode)
+        }
+        val pendingIntent = android.app.PendingIntent.getBroadcast(
+            context,
+            requestCode,
+            intent,
+            android.app.PendingIntent.FLAG_UPDATE_CURRENT or android.app.PendingIntent.FLAG_IMMUTABLE,
+        )
+        val triggerAt = System.currentTimeMillis() + delaySeconds * 1000L
+
+        alarmManager.setExactAndAllowWhileIdle(android.app.AlarmManager.RTC_WAKEUP, triggerAt, pendingIntent)
     }
 
     /**

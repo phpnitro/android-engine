@@ -5,6 +5,7 @@ import android.app.DatePickerDialog
 import android.app.TimePickerDialog
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.graphics.Color
 import android.graphics.RectF
 import android.graphics.Typeface
@@ -25,10 +26,14 @@ import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.TextView
+import android.widget.Toast
 import androidx.activity.OnBackPressedCallback
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.content.ContextCompat
 import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
+import com.google.mlkit.vision.barcode.BarcodeScanning
+import com.google.mlkit.vision.common.InputImage
 import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLEncoder
@@ -53,11 +58,13 @@ import org.json.JSONObject
  * WebView involved anywhere in this Activity.
  *
  * Navigation: a hit region's action starting with "navigate:" (e.g.
- * "navigate:otp", or "navigate:product/42" for a route param — mirrors
+ * "navigate:otp", or "navigate:product?id=42" for one or more route
+ * params, "navigate:product?id=42&tab=reviews" for several — mirrors
  * ProductPage.php's '/product/{id}') pushes that token onto a local back
  * stack and re-fetches — this Activity is what owns "which screen is
  * current", not PHP (each /native/layout-demo request is a stateless
- * render of whichever ?screen=&id= it's given). Plain "back" — or the
+ * render of whichever ?screen=&id=&tab=... it's given, exactly the plain
+ * $_GET a screen's build() already reads). Plain "back" — or the
  * hardware back button, via the OnBackPressedCallback below — pops the
  * stack.
  *
@@ -85,6 +92,12 @@ class NativeRenderPocActivity : AppCompatActivity() {
     // `phpx serve` dev server over the LAN instead of an embedded php-cli
     // process, reusing this exact same rendering pipeline unmodified.
     private var serverHost: String = "127.0.0.1"
+    // Null in remote mode (PhpNitro Go) — the LAN `phpx serve` this talks
+    // to then has no idea what this token even is, see PhpServer.kt's own
+    // accessToken docblock for why that's fine (a documented, accepted,
+    // different threat model). Set right after the embedded PhpServer
+    // starts, read by every fetchDrawCommands() call from then on.
+    private var accessToken: String? = null
     private val screenStack = mutableListOf<String>()
     private val fieldValues = mutableMapOf<String, String>()
     private var activeEditText: EditText? = null
@@ -107,6 +120,7 @@ class NativeRenderPocActivity : AppCompatActivity() {
     // replay tap) before the first one finishes tears down the old view
     // instead of stacking a second one on top of it.
     private var activeConfettiView: ConfettiView? = null
+    private var activeSnackbarView: android.view.View? = null
     // Canvas::stableHash() of the last response actually applied —
     // sent back as lastHash= on the next same-screen refetch so PHP can
     // reply {"unchanged":true} instead of the whole payload when nothing
@@ -152,6 +166,217 @@ class NativeRenderPocActivity : AppCompatActivity() {
         refetch(action = null, includeFields = true)
     }
 
+    // RECORD_AUDIO is a dangerous permission (Android 6+) — declaring it
+    // in the manifest alone doesn't grant it, a real runtime prompt is
+    // required. deviceBridge.recordAudioClip() already checked
+    // checkSelfPermission() and correctly reported "permission_denied"
+    // when missing, but nothing ever actually ASKED for it — the
+    // manifest itself had no <uses-permission> line either, so this was
+    // 100% broken on every real device before this. pendingMicToken
+    // replays the original "mic:field:durationMs" action once the user
+    // answers the prompt, so a screen never needs its own permission
+    // dance — same "just call the action, the round-trip handles it"
+    // promise every other capability here already makes.
+    private var pendingMicToken: String? = null
+
+    private val requestRecordAudioPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        val token = pendingMicToken
+        pendingMicToken = null
+        if (token == null) return@registerForActivityResult
+        if (granted) {
+            startMicRecording(token)
+        } else {
+            val parts = token.split(":")
+            fieldValues[parts.getOrElse(1) { "mic_out" }] = "permission_denied"
+            refetch(action = null, includeFields = true)
+        }
+    }
+
+    private fun startMicRecording(token: String) {
+        val parts = token.split(":")
+        val durationMs = parts.getOrNull(2)?.toLongOrNull() ?: 2000L
+        deviceBridge.recordAudioClip(durationMs) { _, error ->
+            fieldValues[parts.getOrElse(1) { "mic_out" }] = if (error != null) error else "Enregistré (${durationMs}ms)"
+            refetch(action = null, includeFields = true)
+        }
+    }
+
+    // A generic, standalone counterpart to the "mic" action's own
+    // one-off permission dance above — "permission:<key>:<outputField>"
+    // checks (and if needed, prompts for) any ONE of a small whitelisted
+    // set of dangerous permissions this app already declares in its own
+    // AndroidManifest.xml, and reports back "granted"/"denied"/
+    // "unknown_permission" the same fieldValues+refetch way every other
+    // capability here does. A screen that wants to gate some OTHER
+    // feature on a permission (before wiring that feature's own action)
+    // can check/ask up front with this instead of copying "mic"'s whole
+    // pendingToken+launcher dance for itself — this is that dance, done
+    // once, reusable. Deliberately a fixed whitelist, not "request
+    // whatever string PHP sends": a typo'd or made-up permission name
+    // from a screen would otherwise either silently no-op or (worse)
+    // successfully request a permission this app's manifest never
+    // declared, which throws at the OS level with a confusing message
+    // far from where the typo actually is.
+    private val permissionKeys = mapOf(
+        "camera" to android.Manifest.permission.CAMERA,
+        "microphone" to android.Manifest.permission.RECORD_AUDIO,
+        "location" to android.Manifest.permission.ACCESS_FINE_LOCATION,
+        "coarse_location" to android.Manifest.permission.ACCESS_COARSE_LOCATION,
+        "contacts" to android.Manifest.permission.READ_CONTACTS,
+        "calendar" to android.Manifest.permission.READ_CALENDAR,
+        "notifications" to android.Manifest.permission.POST_NOTIFICATIONS,
+        "bluetooth" to android.Manifest.permission.BLUETOOTH_CONNECT,
+    )
+
+    private var pendingPermissionToken: String? = null
+
+    private val requestGenericPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        val token = pendingPermissionToken
+        pendingPermissionToken = null
+        if (token == null) return@registerForActivityResult
+        val parts = token.split(":")
+        fieldValues[parts.getOrElse(2) { "permission_out" }] = if (granted) "granted" else "denied"
+        refetch(action = null, includeFields = true)
+    }
+
+    // Decodes a QR/barcode from a single still, not a live-scanning
+    // preview — see build.gradle.kts's own comment on the
+    // barcode-scanning dependency for why that's the honest scope here
+    // (no persistent camera preview surface on this native Canvas-only
+    // path). A SEPARATE TakePicturePreview launcher from the plain
+    // "camera" action's — that one's callback is hardcoded to
+    // fieldValues["photo_out"], reusing it here would either clobber
+    // that field or need every camera call site to somehow know which
+    // purpose this particular tap was for.
+    private var pendingQrOutputField: String? = null
+
+    private val scanQrPicture = registerForActivityResult(ActivityResultContracts.TakePicturePreview()) { bitmap ->
+        val outputField = pendingQrOutputField ?: "qr_out"
+        pendingQrOutputField = null
+        if (bitmap == null) {
+            fieldValues[outputField] = "Annulé"
+            refetch(action = null, includeFields = true)
+            return@registerForActivityResult
+        }
+        BarcodeScanning.getClient().process(InputImage.fromBitmap(bitmap, 0))
+            .addOnSuccessListener { barcodes ->
+                fieldValues[outputField] = barcodes.firstOrNull()?.rawValue ?: "Aucun code détecté"
+                refetch(action = null, includeFields = true)
+            }
+            .addOnFailureListener { e ->
+                fieldValues[outputField] = e.message ?: "Erreur de décodage"
+                refetch(action = null, includeFields = true)
+            }
+    }
+
+    // Engine\Device\FileSelector — picks any file type (unlike pickImage's
+    // "image/*"), reports back the display name only (see FileSelector's
+    // own docblock for why not the bytes).
+    private var pendingFileOutputField: String? = null
+
+    private val pickFile = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        val outputField = pendingFileOutputField ?: "file_out"
+        pendingFileOutputField = null
+        if (uri == null) {
+            fieldValues[outputField] = "Annulé"
+        } else {
+            var name = uri.lastPathSegment ?: "fichier"
+            contentResolver.query(uri, null, null, null, null)?.use { cursor ->
+                val nameIndex = cursor.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
+                if (nameIndex >= 0 && cursor.moveToFirst()) name = cursor.getString(nameIndex)
+            }
+            fieldValues[outputField] = name
+        }
+        refetch(action = null, includeFields = true)
+    }
+
+    // Engine\Device\ImageCropper — uri=null lets the cropper library
+    // itself prompt for a source image (gallery/camera chooser) before
+    // showing the crop UI, so a screen only needs to fire one action for
+    // the whole "pick then crop" flow, not two.
+    private var pendingCropOutputField: String? = null
+
+    private val cropImage = registerForActivityResult(com.canhub.cropper.CropImageContract()) { result ->
+        val outputField = pendingCropOutputField ?: "crop_out"
+        pendingCropOutputField = null
+        fieldValues[outputField] = when {
+            result.isSuccessful && result.uriContent != null -> "Image recadrée"
+            result.isSuccessful -> "Erreur"
+            else -> "Annulé"
+        }
+        refetch(action = null, includeFields = true)
+    }
+
+    // Engine\Device\InAppUpdate — startUpdateFlowForResult's own launcher;
+    // the flow's UI is entirely Play's, this callback just exists because
+    // the KTX API requires a registered ActivityResultLauncher, there's
+    // nothing of ours to do with its result.
+    private val appUpdateLauncher = registerForActivityResult(ActivityResultContracts.StartIntentSenderForResult()) {}
+
+    // Engine\Device\WebSocket — bound lazily on the FIRST "device:wsconnect"
+    // (not in onCreate()) so an app that never uses WebSocket never starts
+    // the foreground service or shows its persistent notification. Started
+    // AND bound (see WebSocketService's own docblock for why both) — this
+    // Activity being destroyed/recreated (rotation, process death) does
+    // NOT stop the connection, only an explicit "device:wsdisconnect" does.
+    private var webSocketService: WebSocketService? = null
+    private var webSocketBound = false
+    private var pendingWsConnect: Pair<String, String>? = null
+
+    private val webSocketConnection = object : android.content.ServiceConnection {
+        override fun onServiceConnected(name: android.content.ComponentName, binder: android.os.IBinder) {
+            val service = (binder as WebSocketService.LocalBinder).service()
+            webSocketService = service
+            service.setListener { message ->
+                fieldValues[service.currentOutputField()] = message
+                refetch(action = null, includeFields = true)
+            }
+            pendingWsConnect?.let { (url, outputField) ->
+                service.connect(url, outputField)
+                pendingWsConnect = null
+            }
+            // Replays whatever arrived while THIS Activity instance didn't
+            // exist yet (backgrounded and recreated, or a fresh instance
+            // binding to an already-running service) — a plain refetch
+            // (not from a tap) so the screen reflects it without the user
+            // needing to do anything.
+            service.lastMessage?.let { message ->
+                fieldValues[service.currentOutputField()] = message
+                refetch(action = null, includeFields = true)
+            }
+        }
+
+        override fun onServiceDisconnected(name: android.content.ComponentName) {
+            webSocketService = null
+        }
+    }
+
+    private fun ensureWebSocketServiceBound() {
+        if (webSocketBound) return
+        webSocketBound = true
+        val intent = Intent(this, WebSocketService::class.java)
+        ContextCompat.startForegroundService(this, intent)
+        bindService(intent, webSocketConnection, Context.BIND_AUTO_CREATE)
+    }
+
+    private fun handlePermissionAction(token: String) {
+        val parts = token.split(":")
+        val outputField = parts.getOrElse(2) { "permission_out" }
+        val permission = permissionKeys[parts.getOrNull(1)]
+        if (permission == null) {
+            fieldValues[outputField] = "unknown_permission"
+            refetch(action = null, includeFields = true)
+            return
+        }
+        if (ContextCompat.checkSelfPermission(this, permission) == PackageManager.PERMISSION_GRANTED) {
+            fieldValues[outputField] = "granted"
+            refetch(action = null, includeFields = true)
+        } else {
+            pendingPermissionToken = token
+            requestGenericPermission.launch(permission)
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         // Same native SplashScreen MainActivity uses (Theme.App.Starting,
         // themes.xml) — stays up exactly until the PHP server is bound and
@@ -161,6 +386,11 @@ class NativeRenderPocActivity : AppCompatActivity() {
         val splashScreen = installSplashScreen()
         super.onCreate(savedInstanceState)
         splashScreen.setKeepOnScreenCondition { serverPort == 0 || !firstScreenRendered }
+
+        // As early as possible — anything that throws further down in this
+        // very method still gets caught and persisted, not just crashes
+        // once the UI is up.
+        CrashReporter.install(this)
 
         // Without this, every fetchDrawCommands() request gets a BRAND NEW
         // PHPSESSID — java.net.HttpURLConnection never sends/stores cookies
@@ -194,7 +424,7 @@ class NativeRenderPocActivity : AppCompatActivity() {
         // nothing to restore.
         savedInstanceState?.getStringArrayList(STATE_SCREEN_STACK)?.let { screenStack.addAll(it) }
         if (screenStack.isEmpty()) {
-            screenStack.add(intent.getStringExtra("screen") ?: "home")
+            screenStack.add(deepLinkScreenToken(intent) ?: intent.getStringExtra("screen") ?: "home")
         }
 
         canvasView = NativeCanvasView(this)
@@ -205,6 +435,7 @@ class NativeRenderPocActivity : AppCompatActivity() {
         // the next one. No screen state changes (action stays null), same
         // idiom as a plain re-render with the field values already held.
         canvasView.onScrollFollow = { refetch(action = null, includeFields = true) }
+        registerCustomCommandHandlers()
 
         rootLayout = FrameLayout(this)
         rootLayout.addView(canvasView, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
@@ -241,6 +472,7 @@ class NativeRenderPocActivity : AppCompatActivity() {
             refetch(action = null, isNavigation = true)
         } else {
             phpServer = PhpServer(this)
+            accessToken = phpServer.accessToken
             thread {
                 val port = phpServer.start()
                 serverPort = port
@@ -259,6 +491,22 @@ class NativeRenderPocActivity : AppCompatActivity() {
     // screen is current, whether the keyboard is showing), not a
     // server-side state change in their own right.
     private fun onTap(action: String, regionDp: RectF, meta: JSONObject?) {
+        if (inspectMode) {
+            inspectMode = false
+            inspectBadgeView?.alpha = 0.5f
+            android.app.AlertDialog.Builder(this)
+                .setTitle("🔍 Widget inspecté")
+                .setMessage(
+                    "action: $action\n" +
+                        "bounds (dp): x=${"%.1f".format(regionDp.left)} y=${"%.1f".format(regionDp.top)} " +
+                        "w=${"%.1f".format(regionDp.width())} h=${"%.1f".format(regionDp.height())}\n" +
+                        "meta: ${meta?.toString() ?: "—"}",
+                )
+                .setPositiveButton("OK", null)
+                .show()
+            return
+        }
+
         when {
             action.startsWith("focus:") -> {
                 var rest = action.removePrefix("focus:")
@@ -285,6 +533,7 @@ class NativeRenderPocActivity : AppCompatActivity() {
                 refetch(action = null, includeFields = true)
             }
             action.startsWith("video:play:") -> showVideoOverlay(action.removePrefix("video:play:"), regionDp)
+            action.startsWith("youtube:play:") -> showYoutubeOverlay(action.removePrefix("youtube:play:"), regionDp)
             action.startsWith("map:open:") -> {
                 val parts = action.removePrefix("map:open:").split(":")
                 val lat = parts.getOrNull(0)?.toDoubleOrNull() ?: 48.8566
@@ -599,8 +848,16 @@ class NativeRenderPocActivity : AppCompatActivity() {
     private fun handleDeviceAction(token: String) {
         val parts = token.split(":")
         when (parts.getOrNull(0)) {
-            "vibrate" -> deviceBridge.vibrate(200)
-            "torch" -> deviceBridge.toggleTorch()
+            "vibrate" -> deviceBridge.vibrate(parts.getOrNull(1)?.toLongOrNull() ?: 200)
+            "torch" -> {
+                fieldValues[parts.getOrElse(1) { "torch_out" }] = if (deviceBridge.toggleTorch()) "on" else "off"
+                refetch(action = null, includeFields = true)
+            }
+            // See CrashReporter — a real user's actual path to a
+            // developer's inbox for a crash that already happened,
+            // regardless of build type (no debug gate, unlike the dev
+            // tools overlay).
+            "report_crash" -> deviceBridge.share(CrashReporter.formatForSharing(this), "Rapport de bug PhpNitro")
             "battery" -> {
                 fieldValues[parts.getOrElse(1) { "battery_out" }] = "${deviceBridge.batteryLevel()}%"
                 refetch(action = null, includeFields = true)
@@ -613,9 +870,13 @@ class NativeRenderPocActivity : AppCompatActivity() {
                 fieldValues[parts.getOrElse(1) { "bt_out" }] = deviceBridge.bluetoothState()
                 refetch(action = null, includeFields = true)
             }
-            "securestore" -> deviceBridge.secureStore(parts.getOrElse(1) { "demo_key" }, "valeur secrète")
+            "securestore" -> {
+                val key = java.net.URLDecoder.decode(parts.getOrElse(1) { "demo_key" }, "UTF-8")
+                val value = java.net.URLDecoder.decode(parts.getOrElse(2) { "" }, "UTF-8")
+                deviceBridge.secureStore(key, value)
+            }
             "secureretrieve" -> {
-                val key = parts.getOrElse(1) { "demo_key" }
+                val key = java.net.URLDecoder.decode(parts.getOrElse(1) { "demo_key" }, "UTF-8")
                 fieldValues[parts.getOrElse(2) { "secure_out" }] = deviceBridge.secureRetrieve(key)
                 refetch(action = null, includeFields = true)
             }
@@ -629,9 +890,21 @@ class NativeRenderPocActivity : AppCompatActivity() {
                 fieldValues[parts.getOrElse(1) { "calendar_out" }] = if (count < 0) "Permission requise" else "$count événements"
                 refetch(action = null, includeFields = true)
             }
-            "sound" -> deviceBridge.playSound("http://$serverHost:$serverPort/assets/audio/beep.wav")
-            "notify" -> deviceBridge.showNotification("PhpNitro", "Ceci est une notification native.")
-            "share" -> deviceBridge.share("Regarde cette app faite avec PhpNitro !", "PhpNitro Demo")
+            "sound" -> {
+                val url = parts.getOrNull(1)?.let { java.net.URLDecoder.decode(it, "UTF-8") }
+                    ?: "http://$serverHost:$serverPort/assets/audio/beep.wav"
+                deviceBridge.playSound(url)
+            }
+            "notify" -> {
+                val title = java.net.URLDecoder.decode(parts.getOrElse(1) { "PhpNitro" }, "UTF-8")
+                val message = java.net.URLDecoder.decode(parts.getOrElse(2) { "Ceci est une notification native." }, "UTF-8")
+                deviceBridge.showNotification(title, message)
+            }
+            "share" -> {
+                val text = java.net.URLDecoder.decode(parts.getOrElse(1) { "Regarde cette app faite avec PhpNitro !" }, "UTF-8")
+                val title = java.net.URLDecoder.decode(parts.getOrElse(2) { "PhpNitro" }, "UTF-8")
+                deviceBridge.share(text, title)
+            }
             "appicon" -> deviceBridge.setAppIcon(parts.getOrElse(1) { "default" })
             // Manual "🎉 encore" replay button — Confetti::triggerAction().
             // The automatic case (Canvas::triggerConfetti(), a widget
@@ -639,7 +912,7 @@ class NativeRenderPocActivity : AppCompatActivity() {
             // since that one has to fire on every matching render, not
             // just a tap.
             "confetti" -> showConfettiOverlay()
-            "brightness" -> deviceBridge.setBrightness(0.5f)
+            "brightness" -> deviceBridge.setBrightness(parts.getOrNull(1)?.toFloatOrNull() ?: 0.5f)
             "locate" -> {
                 deviceBridge.getLocation { result ->
                     fieldValues[parts.getOrElse(1) { "location_out" }] = result
@@ -653,13 +926,22 @@ class NativeRenderPocActivity : AppCompatActivity() {
                 }
             }
             "mic" -> {
-                deviceBridge.recordAudioClip(2000L) { _, error ->
-                    fieldValues[parts.getOrElse(1) { "mic_out" }] = if (error != null) error else "Enregistré (2s)"
-                    refetch(action = null, includeFields = true)
+                if (ContextCompat.checkSelfPermission(this, android.Manifest.permission.RECORD_AUDIO) ==
+                    PackageManager.PERMISSION_GRANTED
+                ) {
+                    startMicRecording(token)
+                } else {
+                    pendingMicToken = token
+                    requestRecordAudioPermission.launch(android.Manifest.permission.RECORD_AUDIO)
                 }
             }
             "camera" -> takePicturePreview.launch(null)
             "pickimage" -> pickImage.launch("image/*")
+            "permission" -> handlePermissionAction(token)
+            "scanqr" -> {
+                pendingQrOutputField = parts.getOrElse(1) { "qr_out" }
+                scanQrPicture.launch(null)
+            }
             "googlesignin" -> {
                 val webClientId = getString(R.string.google_web_client_id)
                 deviceBridge.signInWithGoogle(webClientId) { idToken, error ->
@@ -686,17 +968,254 @@ class NativeRenderPocActivity : AppCompatActivity() {
                 nfcAdapter?.disableForegroundDispatch(this)
             }
             "iapquery" -> {
-                deviceBridge.queryProducts(listOf("demo_product")) { result ->
-                    fieldValues[parts.getOrElse(1) { "iap_out" }] = result
+                val productId = java.net.URLDecoder.decode(parts.getOrElse(1) { "demo_product" }, "UTF-8")
+                deviceBridge.queryProducts(listOf(productId)) { result ->
+                    fieldValues[parts.getOrElse(2) { "iap_out" }] = result
                     refetch(action = null, includeFields = true)
                 }
             }
-            "iappurchase" -> deviceBridge.purchaseProduct("demo_product")
-            "geofenceadd" -> deviceBridge.addGeofence("paris_demo", 48.8566, 2.3522, 200f)
-            "geofenceremove" -> deviceBridge.removeGeofence("paris_demo")
-            "bgschedule" -> deviceBridge.scheduleBackgroundTask("/api/ping", 15)
+            "iappurchase" -> {
+                val productId = java.net.URLDecoder.decode(parts.getOrElse(1) { "demo_product" }, "UTF-8")
+                deviceBridge.purchaseProduct(productId)
+            }
+            "geofenceadd" -> {
+                val id = java.net.URLDecoder.decode(parts.getOrElse(1) { "paris_demo" }, "UTF-8")
+                val lat = parts.getOrNull(2)?.toDoubleOrNull() ?: 48.8566
+                val lng = parts.getOrNull(3)?.toDoubleOrNull() ?: 2.3522
+                val radius = parts.getOrNull(4)?.toFloatOrNull() ?: 200f
+                deviceBridge.addGeofence(id, lat, lng, radius)
+            }
+            "geofenceremove" -> {
+                val id = java.net.URLDecoder.decode(parts.getOrElse(1) { "paris_demo" }, "UTF-8")
+                deviceBridge.removeGeofence(id)
+            }
+            "bgschedule" -> {
+                val endpoint = java.net.URLDecoder.decode(parts.getOrElse(1) { "/api/ping" }, "UTF-8")
+                val interval = parts.getOrNull(2)?.toIntOrNull() ?: 15
+                deviceBridge.scheduleBackgroundTask(endpoint, interval)
+            }
             "bgcancel" -> deviceBridge.cancelBackgroundTask()
+            "alarmschedule" -> {
+                val requestCode = parts.getOrNull(1)?.toIntOrNull() ?: 1
+                val delaySeconds = parts.getOrNull(2)?.toIntOrNull() ?: 3600
+                val title = java.net.URLDecoder.decode(parts.getOrElse(3) { "Rappel" }, "UTF-8")
+                val message = java.net.URLDecoder.decode(parts.getOrElse(4) { "" }, "UTF-8")
+                deviceBridge.scheduleAlarm(requestCode, delaySeconds, title, message)
+            }
             "printpdf" -> printCurrentScreen()
+            // Engine\Device\UrlLauncher — the URL travels rawurlencode()'d
+            // (see UrlLauncher's own docblock for why), decoded back here.
+            "openurl" -> {
+                val url = java.net.URLDecoder.decode(parts.getOrElse(1) { "" }, "UTF-8")
+                if (url.isNotEmpty()) startActivity(Intent(Intent.ACTION_VIEW, android.net.Uri.parse(url)))
+            }
+            // Engine\Device\Connectivity — reuses the same isOnline() the
+            // WebView path's Engine\Connectivity\ConnectivityBadge calls.
+            "connectivity" -> {
+                fieldValues[parts.getOrElse(1) { "connectivity_out" }] = if (deviceBridge.isOnline()) "online" else "offline"
+                refetch(action = null, includeFields = true)
+            }
+            // Engine\Device\InAppReview — Play Core's own review sheet;
+            // no result to report, see InAppReview's own docblock for why
+            // Play never guarantees the prompt actually shows.
+            "inappreview" -> {
+                val manager = com.google.android.play.core.review.ReviewManagerFactory.create(this)
+                manager.requestReviewFlow().addOnCompleteListener { task ->
+                    if (task.isSuccessful) manager.launchReviewFlow(this, task.result)
+                }
+            }
+            // Engine\Device\AppLinks — the current Intent's own data URI;
+            // setIntent() in onNewIntent() keeps `intent` current even
+            // after the launching Intent that started this instance.
+            "applink" -> {
+                fieldValues[parts.getOrElse(1) { "app_link_out" }] = intent?.data?.toString() ?: "Aucun lien"
+                refetch(action = null, includeFields = true)
+            }
+            // Engine\Device\AppSettings — a fixed whitelist of Settings
+            // screens, same "reject an unknown key up front" pattern
+            // handlePermissionAction() uses; an unrecognised $screen falls
+            // back to this app's own detail page.
+            "appsettings" -> {
+                val settingsIntent = when (parts.getOrElse(1) { "app" }) {
+                    "wifi" -> Intent(android.provider.Settings.ACTION_WIFI_SETTINGS)
+                    "location" -> Intent(android.provider.Settings.ACTION_LOCATION_SOURCE_SETTINGS)
+                    "notifications" -> Intent(android.provider.Settings.ACTION_APP_NOTIFICATION_SETTINGS)
+                        .putExtra(android.provider.Settings.EXTRA_APP_PACKAGE, packageName)
+                    "bluetooth" -> Intent(android.provider.Settings.ACTION_BLUETOOTH_SETTINGS)
+                    else -> Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS, android.net.Uri.fromParts("package", packageName, null))
+                }
+                startActivity(settingsIntent)
+            }
+            // Engine\Device\OpenFile — writes the demo content to this
+            // app's own files dir, then hands it off via the FileProvider
+            // declared in this module's AndroidManifest.xml (see
+            // res/xml/file_paths.xml) — a raw file:// Uri would be
+            // rejected across app boundaries since API 24.
+            "openfile" -> {
+                // java.io.File(filesDir, fileName)'s two-arg constructor
+                // does NOT confine the result to filesDir — a fileName of
+                // "../../../etc/whatever" resolves right past it (a real
+                // path-traversal write, not a hypothetical one). Taking
+                // just File(fileName).name discards any directory
+                // component before it ever reaches the real File(dir,
+                // name) constructor below.
+                val fileName = java.io.File(java.net.URLDecoder.decode(parts.getOrElse(1) { "document.txt" }, "UTF-8")).name
+                val mimeType = java.net.URLDecoder.decode(parts.getOrElse(2) { "text/plain" }, "UTF-8")
+                val content = java.net.URLDecoder.decode(parts.getOrElse(3) { "" }, "UTF-8")
+                val file = java.io.File(filesDir, fileName)
+                file.writeText(content)
+                val uri = androidx.core.content.FileProvider.getUriForFile(this, "$packageName.fileprovider", file)
+                startActivity(
+                    Intent(Intent.ACTION_VIEW).apply {
+                        setDataAndType(uri, mimeType)
+                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    },
+                )
+            }
+            // Engine\Device\InAppUpdate — outside a real Play Store
+            // install this always resolves to update_not_available (no
+            // Play-side release exists to compare against), see
+            // InAppUpdate's own docblock.
+            "checkupdate" -> {
+                val outputField = parts.getOrElse(1) { "update_out" }
+                val appUpdateManager = com.google.android.play.core.appupdate.AppUpdateManagerFactory.create(this)
+                appUpdateManager.appUpdateInfo
+                    .addOnSuccessListener { info ->
+                        if (info.updateAvailability() == com.google.android.play.core.install.model.UpdateAvailability.UPDATE_AVAILABLE &&
+                            info.isUpdateTypeAllowed(com.google.android.play.core.install.model.AppUpdateType.FLEXIBLE)
+                        ) {
+                            fieldValues[outputField] = "update_available"
+                            appUpdateManager.startUpdateFlowForResult(
+                                info,
+                                appUpdateLauncher,
+                                com.google.android.play.core.appupdate.AppUpdateOptions.newBuilder(
+                                    com.google.android.play.core.install.model.AppUpdateType.FLEXIBLE,
+                                ).build(),
+                            )
+                        } else {
+                            fieldValues[outputField] = "update_not_available"
+                        }
+                        refetch(action = null, includeFields = true)
+                    }
+                    .addOnFailureListener {
+                        fieldValues[outputField] = "update_not_available"
+                        refetch(action = null, includeFields = true)
+                    }
+            }
+            "pickfile" -> {
+                pendingFileOutputField = parts.getOrElse(1) { "file_out" }
+                pickFile.launch(arrayOf("*/*"))
+            }
+            // Engine\Device\MapLauncher — a "geo:" Uri, resolved by
+            // whichever maps app the OS has (or a chooser if several).
+            "openmap" -> {
+                val lat = parts.getOrNull(1) ?: "0"
+                val lng = parts.getOrNull(2) ?: "0"
+                val label = java.net.URLDecoder.decode(parts.getOrElse(3) { "" }, "UTF-8")
+                val geoUri = if (label.isNotEmpty()) {
+                    android.net.Uri.parse("geo:$lat,$lng?q=$lat,$lng(${android.net.Uri.encode(label)})")
+                } else {
+                    android.net.Uri.parse("geo:$lat,$lng?q=$lat,$lng")
+                }
+                startActivity(Intent(Intent.ACTION_VIEW, geoUri))
+            }
+            // Engine\Device\FileSaver — MediaStore.Downloads needs API 29+
+            // (the scoped-storage way, no WRITE_EXTERNAL_STORAGE
+            // permission); minSdk here is 24, hence the version gate.
+            "savefile" -> {
+                val fileName = java.net.URLDecoder.decode(parts.getOrElse(1) { "phpnitro.txt" }, "UTF-8")
+                val content = java.net.URLDecoder.decode(parts.getOrElse(2) { "" }, "UTF-8")
+                val outputField = parts.getOrElse(3) { "save_out" }
+                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
+                    try {
+                        val values = android.content.ContentValues().apply {
+                            put(android.provider.MediaStore.Downloads.DISPLAY_NAME, fileName)
+                            put(android.provider.MediaStore.Downloads.MIME_TYPE, "text/plain")
+                        }
+                        val uri = contentResolver.insert(android.provider.MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+                        if (uri != null) {
+                            contentResolver.openOutputStream(uri)?.use { it.write(content.toByteArray()) }
+                            fieldValues[outputField] = "Enregistré"
+                        } else {
+                            fieldValues[outputField] = "Erreur d'enregistrement"
+                        }
+                    } catch (e: Exception) {
+                        fieldValues[outputField] = e.message ?: "Erreur d'enregistrement"
+                    }
+                } else {
+                    fieldValues[outputField] = "Non supporté (Android < 10)"
+                }
+                refetch(action = null, includeFields = true)
+            }
+            "clipboardcopy" -> {
+                val text = java.net.URLDecoder.decode(parts.getOrElse(1) { "" }, "UTF-8")
+                val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+                clipboard.setPrimaryClip(android.content.ClipData.newPlainText("PhpNitro", text))
+            }
+            "clipboardpaste" -> {
+                val outputField = parts.getOrElse(1) { "clipboard_out" }
+                val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+                val text = clipboard.primaryClip?.takeIf { it.itemCount > 0 }?.getItemAt(0)?.coerceToText(this)?.toString()
+                fieldValues[outputField] = text?.takeIf { it.isNotEmpty() } ?: "Presse-papiers vide ou inaccessible"
+                refetch(action = null, includeFields = true)
+            }
+            // Engine\Device\EmailSender — ACTION_SENDTO with a "mailto:"
+            // Uri only ever matches real mail apps, unlike ACTION_SEND.
+            "sendemail" -> {
+                val to = java.net.URLDecoder.decode(parts.getOrElse(1) { "" }, "UTF-8")
+                val subject = java.net.URLDecoder.decode(parts.getOrElse(2) { "" }, "UTF-8")
+                val body = java.net.URLDecoder.decode(parts.getOrElse(3) { "" }, "UTF-8")
+                startActivity(
+                    Intent(Intent.ACTION_SENDTO).apply {
+                        data = android.net.Uri.parse("mailto:")
+                        putExtra(Intent.EXTRA_EMAIL, arrayOf(to))
+                        putExtra(Intent.EXTRA_SUBJECT, subject)
+                        putExtra(Intent.EXTRA_TEXT, body)
+                    },
+                )
+            }
+            // Engine\Device\RestartApp — relaunches the launcher Intent
+            // with FLAG_ACTIVITY_CLEAR_TASK, then kills this process, so
+            // the next launch is a genuinely fresh process.
+            "restartapp" -> {
+                val restartIntent = packageManager.getLaunchIntentForPackage(packageName)
+                restartIntent?.addFlags(Intent.FLAG_ACTIVITY_CLEAR_TASK or Intent.FLAG_ACTIVITY_NEW_TASK)
+                if (restartIntent != null) startActivity(restartIntent)
+                Runtime.getRuntime().exit(0)
+            }
+            // Engine\Device\WebSocket — a REAL persistent connection (see
+            // WebSocketService), not polling. The URL travels
+            // rawurlencode()'d, same reason UrlLauncher's own "openurl"
+            // does.
+            "wsconnect" -> {
+                val url = java.net.URLDecoder.decode(parts.getOrElse(1) { "" }, "UTF-8")
+                val outputField = parts.getOrElse(2) { "ws_out" }
+                val service = webSocketService
+                if (service != null) {
+                    service.connect(url, outputField)
+                } else {
+                    pendingWsConnect = url to outputField
+                    ensureWebSocketServiceBound()
+                }
+            }
+            "wssend" -> {
+                val message = java.net.URLDecoder.decode(parts.getOrElse(1) { "" }, "UTF-8")
+                webSocketService?.send(message)
+            }
+            "wsdisconnect" -> {
+                webSocketService?.disconnect()
+                if (webSocketBound) {
+                    unbindService(webSocketConnection)
+                    webSocketBound = false
+                }
+                stopService(Intent(this, WebSocketService::class.java))
+                webSocketService = null
+            }
+            "cropimage" -> {
+                pendingCropOutputField = parts.getOrElse(1) { "crop_out" }
+                cropImage.launch(com.canhub.cropper.CropImageContractOptions(uri = null, cropImageOptions = com.canhub.cropper.CropImageOptions()))
+            }
         }
     }
 
@@ -790,6 +1309,7 @@ class NativeRenderPocActivity : AppCompatActivity() {
             .hideSoftInputFromWindow(canvasView.windowToken, 0)
         clearVideoOverlay()
         clearMapOverlay()
+        clearYoutubeOverlay()
     }
 
     // Lottie: unlike the video/map overlays below (shown only on
@@ -867,6 +1387,59 @@ class NativeRenderPocActivity : AppCompatActivity() {
         activeVideoView = null
     }
 
+    // YoutubePlayer (Engine\Native\YoutubePlayer) — same tap-to-play
+    // overlay idiom as showVideoOverlay() just above (one-shot, added on
+    // tap, torn down by clearTextInput() on every navigate/back/submit),
+    // just a WebView loaded with YouTube's IFrame embed instead of a
+    // VideoView + raw media URL: YouTube requires their own embed player
+    // (a raw .mp4/.m3u8 URL isn't available for a YouTube video), and the
+    // IFrame Player API is the same technique every current
+    // youtube_player_flutter/react-native-youtube-iframe package uses
+    // under the hood — not a compromise specific to this framework.
+    private var activeYoutubeView: android.webkit.WebView? = null
+
+    private fun showYoutubeOverlay(videoId: String, regionDp: RectF) {
+        clearYoutubeOverlay()
+
+        val density = resources.displayMetrics.density
+        val webView = android.webkit.WebView(this).apply {
+            settings.javaScriptEnabled = true
+            settings.mediaPlaybackRequiresUserGesture = false
+            webChromeClient = android.webkit.WebChromeClient()
+            loadDataWithBaseURL(
+                "https://www.youtube.com",
+                "<html><body style=\"margin:0;padding:0;background:#000;\">" +
+                    "<iframe width=\"100%\" height=\"100%\" " +
+                    "src=\"https://www.youtube.com/embed/$videoId?autoplay=1&playsinline=1\" " +
+                    "frameborder=\"0\" allow=\"autoplay; encrypted-media\" allowfullscreen></iframe>" +
+                    "</body></html>",
+                "text/html",
+                "utf-8",
+                null,
+            )
+        }
+        val params = FrameLayout.LayoutParams(
+            (regionDp.width() * density).toInt(),
+            (regionDp.height() * density).toInt(),
+        ).apply {
+            leftMargin = (regionDp.left * density).toInt()
+            topMargin = (regionDp.top * density).toInt()
+        }
+        rootLayout.addView(webView, params)
+        activeYoutubeView = webView
+    }
+
+    private fun clearYoutubeOverlay() {
+        activeYoutubeView?.let {
+            // Navigating away first stops audio/playback before the View
+            // is actually removed — simply removeView()-ing a still-
+            // playing embedded player leaves its audio track running.
+            it.loadUrl("about:blank")
+            rootLayout.removeView(it)
+        }
+        activeYoutubeView = null
+    }
+
     // See ConfettiView's own docblock for the actual particle simulation
     // — this is just the overlay lifecycle (add, start, remove itself
     // after its own duration), the same shape every other full-screen/
@@ -889,6 +1462,52 @@ class NativeRenderPocActivity : AppCompatActivity() {
                 activeConfettiView = null
             }
         }, durationMs)
+    }
+
+    // See Canvas::showSnackbar()/Snackbar's own docblocks. Fade in, hold,
+    // fade out, self-remove — the identity check (activeSnackbarView ===
+    // thisView) before every removal/fade-out guards against a SECOND
+    // snackbar firing while the first one's still holding: the first
+    // one's own delayed callback would otherwise fire later and rip out
+    // the second one's view instead of its own.
+    private fun showSnackbarOverlay(message: String, durationMs: Long) {
+        activeSnackbarView?.let { rootLayout.removeView(it) }
+
+        val density = resources.displayMetrics.density
+        fun dp(value: Int) = (value * density).toInt()
+
+        val snackbarView = TextView(this).apply {
+            text = message
+            setTextColor(android.graphics.Color.WHITE)
+            textSize = 14f
+            setPadding(dp(16), dp(14), dp(16), dp(14))
+            background = android.graphics.drawable.GradientDrawable().apply {
+                setColor(android.graphics.Color.parseColor("#EE111827"))
+                cornerRadius = dp(10).toFloat()
+            }
+            alpha = 0f
+        }
+        val params = FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+            gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
+            bottomMargin = dp(32)
+            leftMargin = dp(24)
+            rightMargin = dp(24)
+        }
+        rootLayout.addView(snackbarView, params)
+        activeSnackbarView = snackbarView
+
+        snackbarView.animate().alpha(1f).setDuration(200).start()
+
+        val holdMs = (durationMs - 400L).coerceAtLeast(0L)
+        Handler(Looper.getMainLooper()).postDelayed({
+            if (activeSnackbarView !== snackbarView) return@postDelayed
+            snackbarView.animate().alpha(0f).setDuration(200).withEndAction {
+                if (activeSnackbarView === snackbarView) {
+                    rootLayout.removeView(snackbarView)
+                    activeSnackbarView = null
+                }
+            }.start()
+        }, holdMs)
     }
 
     // A real, pannable/zoomable org.osmdroid.views.MapView (pinch-zoom is
@@ -944,8 +1563,117 @@ class NativeRenderPocActivity : AppCompatActivity() {
     private var lastRoundTripMs = 0.0
     private var lastPhpRenderTimeMs: Double? = null
 
+    // Widget inspector — Flutter DevTools' "Select Widget Mode" but
+    // scoped to what's actually available here: no widget tree survives
+    // past paint() server-side to inspect, only the flat hit region list
+    // NativeCanvasView already hit-tests against. Toggling this ON makes
+    // onTap() (below) intercept the NEXT tap and show that region's
+    // action string + dp bounds in a dialog instead of dispatching it —
+    // enough to answer "why isn't this tappable"/"what action does this
+    // actually send" without adding server round-trip protocol.
+    private var inspectMode = false
+    private var inspectBadgeView: TextView? = null
+
     private fun isDebuggable(): Boolean =
         (applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0
+
+    // The real, wired proof that Canvas::custom()/registerCustomCommandHandler()
+    // works end to end: NativeCanvasView.kt has no built-in idea what a
+    // "sparkline" is, only this app-layer registration does. A real
+    // third-party package would call canvasView.registerCustomCommandHandler()
+    // the exact same way, from wherever it hooks into a consuming app —
+    // this method is that hook, not a special engine-internal case.
+    private fun registerCustomCommandHandlers() {
+        canvasView.registerCustomCommandHandler("sparkline") { canvas, command, alpha ->
+            val x = command.getDouble("x").toFloat()
+            val y = command.getDouble("y").toFloat()
+            val w = command.getDouble("width").toFloat()
+            val h = command.getDouble("height").toFloat()
+            val values = command.getJSONArray("values")
+            if (values.length() >= 2) {
+                var min = Double.MAX_VALUE
+                var max = -Double.MAX_VALUE
+                for (i in 0 until values.length()) {
+                    val v = values.getDouble(i)
+                    if (v < min) min = v
+                    if (v > max) max = v
+                }
+                val range = (max - min).let { if (it > 0.0) it else 1.0 }
+                val paint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
+                    style = android.graphics.Paint.Style.STROKE
+                    strokeWidth = 2.5f
+                    strokeCap = android.graphics.Paint.Cap.ROUND
+                    strokeJoin = android.graphics.Paint.Join.ROUND
+                    color = Color.parseColor(command.getString("color"))
+                    this.alpha = (this.alpha * alpha).toInt()
+                }
+                val path = android.graphics.Path()
+                for (i in 0 until values.length()) {
+                    val px = x + w * i / (values.length() - 1)
+                    val py = y + h - h * ((values.getDouble(i) - min) / range).toFloat()
+                    if (i == 0) path.moveTo(px, py) else path.lineTo(px, py)
+                }
+                canvas.drawPath(path, paint)
+            }
+        }
+
+        // BarChart (Engine\Native\BarChart) — same custom-command pattern
+        // as sparkline right above, registered here rather than a new
+        // drawXxxCommand() in NativeCanvasView.kt for the same reason.
+        canvasView.registerCustomCommandHandler("barChart") { canvas, command, alpha ->
+            val x = command.getDouble("x").toFloat()
+            val y = command.getDouble("y").toFloat()
+            val w = command.getDouble("width").toFloat()
+            val h = command.getDouble("height").toFloat()
+            val gap = command.getDouble("gap").toFloat()
+            val values = command.getJSONArray("values")
+            val count = values.length()
+            if (count > 0) {
+                var max = 0.0
+                for (i in 0 until count) max = maxOf(max, values.getDouble(i))
+                if (max <= 0.0) max = 1.0
+                val barWidth = (w - gap * (count - 1)) / count
+                val paint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
+                    style = android.graphics.Paint.Style.FILL
+                    color = Color.parseColor(command.getString("color"))
+                    this.alpha = (this.alpha * alpha).toInt()
+                }
+                for (i in 0 until count) {
+                    val barHeight = (h * (values.getDouble(i) / max)).toFloat().coerceAtLeast(0f)
+                    val left = x + i * (barWidth + gap)
+                    canvas.drawRect(left, y + h - barHeight, left + barWidth, y + h, paint)
+                }
+            }
+        }
+
+        // PieChart (Engine\Native\PieChart) — same pattern again, one arc
+        // per slice via drawArc(useCenter = true), sweep angle
+        // proportional to that slice's share of the total.
+        canvasView.registerCustomCommandHandler("pieChart") { canvas, command, alpha ->
+            val x = command.getDouble("x").toFloat()
+            val y = command.getDouble("y").toFloat()
+            val diameter = command.getDouble("diameter").toFloat()
+            val values = command.getJSONArray("values")
+            val colors = command.getJSONArray("colors")
+            val count = values.length()
+            var total = 0.0
+            for (i in 0 until count) total += values.getDouble(i)
+            if (count > 0 && total > 0.0) {
+                val rect = android.graphics.RectF(x, y, x + diameter, y + diameter)
+                val paint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
+                    style = android.graphics.Paint.Style.FILL
+                }
+                var startAngle = -90f
+                for (i in 0 until count) {
+                    val sweep = (values.getDouble(i) / total * 360.0).toFloat()
+                    paint.color = Color.parseColor(colors.getString(i))
+                    paint.alpha = (paint.alpha * alpha).toInt()
+                    canvas.drawArc(rect, startAngle, sweep, true, paint)
+                    startAngle += sweep
+                }
+            }
+        }
+    }
 
     private fun setupDevTools() {
         val density = resources.displayMetrics.density
@@ -972,6 +1700,35 @@ class NativeRenderPocActivity : AppCompatActivity() {
             bottomMargin = dp(24f)
         }
         rootLayout.addView(badge, badgeParams)
+
+        val inspectBadge = TextView(this).apply {
+            text = "🔍"
+            textSize = 18f
+            setPadding(dp(10f), dp(6f), dp(10f), dp(6f))
+            background = android.graphics.drawable.GradientDrawable().apply {
+                setColor(android.graphics.Color.parseColor("#CC111827"))
+                cornerRadius = dp(20f).toFloat()
+            }
+            setTextColor(android.graphics.Color.WHITE)
+            isClickable = true
+            setOnClickListener {
+                inspectMode = !inspectMode
+                alpha = if (inspectMode) 1f else 0.5f
+                Toast.makeText(
+                    this@NativeRenderPocActivity,
+                    if (inspectMode) "Inspecteur : ON — tapez un élément" else "Inspecteur : OFF",
+                    Toast.LENGTH_SHORT,
+                ).show()
+            }
+            alpha = 0.5f
+        }
+        val inspectBadgeParams = FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+            gravity = Gravity.BOTTOM or Gravity.END
+            marginEnd = dp(68f)
+            bottomMargin = dp(24f)
+        }
+        rootLayout.addView(inspectBadge, inspectBadgeParams)
+        inspectBadgeView = inspectBadge
 
         val panel = TextView(this).apply {
             typeface = Typeface.MONOSPACE
@@ -1034,15 +1791,49 @@ class NativeRenderPocActivity : AppCompatActivity() {
         val density = resources.displayMetrics.density
         val screenWidthDp = resources.displayMetrics.widthPixels / density
         val screenHeightDp = resources.displayMetrics.heightPixels / density
-        // "product/42" -> screen=product, id=42 — a route-param screen
-        // token is just "name/param", split once at fetch time rather
-        // than teaching screenStack about a richer shape.
+        // "product?id=42&tab=reviews" -> screen=product, a real query
+        // string carrying however many named params a screen needs — a
+        // route-param screen token is just "name?query", split once at
+        // fetch time rather than teaching screenStack about a richer
+        // shape. Each pair is re-encoded individually (not passed through
+        // as-is) so a param VALUE containing "&"/"=" or non-ASCII text
+        // can't corrupt the URL or collide with the other query params
+        // appended below (action/online/dark/...).
         val screenToken = screenStack.last()
-        val screen = screenToken.substringBefore('/')
-        val screenParam = screenToken.substringAfter('/', missingDelimiterValue = "").ifEmpty { null }
-        val idParam = if (screenParam != null) "&id=${URLEncoder.encode(screenParam, "UTF-8")}" else ""
+        val screen = screenToken.substringBefore('?')
+        val rawQuery = screenToken.substringAfter('?', missingDelimiterValue = "")
+        val routeParams = if (rawQuery.isEmpty()) {
+            ""
+        } else {
+            "&" + rawQuery.split("&").joinToString("&") { pair ->
+                val parts = pair.split("=", limit = 2)
+                val key = URLEncoder.encode(parts[0], "UTF-8")
+                val value = URLEncoder.encode(parts.getOrElse(1) { "" }, "UTF-8")
+                "$key=$value"
+            }
+        }
         val actionParam = if (action != null) "&action=${URLEncoder.encode(action, "UTF-8")}" else ""
         val onlineParam = "&online=${if (deviceBridge.isOnline()) 1 else 0}"
+        // Tokens::init()'s own param — Configuration.UI_MODE_NIGHT_YES is
+        // the system's real current setting (dark-mode toggle in Android
+        // Settings, or the phone's day/night schedule), not anything
+        // this app tracks or lets the user override itself yet. Read
+        // fresh on every fetch rather than cached at onCreate() so
+        // toggling system dark mode while the app is already open (a
+        // real, common thing to do — the OS supports it live) takes
+        // effect on the very next tap/refetch instead of needing a
+        // restart.
+        val nightModeFlags = resources.configuration.uiMode and android.content.res.Configuration.UI_MODE_NIGHT_MASK
+        val darkParam = "&dark=${if (nightModeFlags == android.content.res.Configuration.UI_MODE_NIGHT_YES) 1 else 0}"
+        // Translator::init()'s own param — the device's real system
+        // language (Settings -> System -> Languages), same "system
+        // default, no separate in-app setting to remember to change"
+        // story as darkParam above. Only the bare language subtag
+        // ("fr", "en") travels, not a full BCP 47 tag (fr-FR, en-US) —
+        // lib/lang/*.php is keyed by language only; a project that
+        // genuinely needs region-specific variants would need its own
+        // richer locale files, not something this v1 tries to solve.
+        val localeParam = "&locale=${URLEncoder.encode(resources.configuration.locales[0].language, "UTF-8")}"
         // LazyList's windowed prefetch needs to know where the user
         // actually is in the virtual list to build the right window —
         // harmless for every other screen, which simply never reads it.
@@ -1071,11 +1862,35 @@ class NativeRenderPocActivity : AppCompatActivity() {
         // "network/parse overhead" instead of one opaque total.
         val startNanos = System.nanoTime()
         try {
-            val connection = URL("http://$serverHost:$port/native/layout-demo?width=$screenWidthDp&height=$screenHeightDp&screen=$screen$idParam$actionParam$onlineParam$scrollYParam$fieldsParam$lastHashParam").openConnection() as HttpURLConnection
+            val connection = URL("http://$serverHost:$port/native/layout-demo?width=$screenWidthDp&height=$screenHeightDp&screen=$screen$routeParams$actionParam$onlineParam$darkParam$localeParam$scrollYParam$fieldsParam$lastHashParam").openConnection() as HttpURLConnection
             connection.connectTimeout = 5000
-            Log.i(TAG, "Fetching /native/layout-demo (screen=$screen, action=$action), response code ${connection.responseCode}")
-            val json = connection.inputStream.bufferedReader().use { it.readText() }
+            // Absent in remote mode (accessToken stays null, see its own
+            // field docblock) — public/index.php only enforces this
+            // header when PHPNITRO_ACCESS_TOKEN is actually set in its
+            // environment, which phpx serve never sets either, so this
+            // is a no-op there regardless.
+            accessToken?.let { connection.setRequestProperty("X-PhpNitro-Token", it) }
+            val responseCode = connection.responseCode
+            Log.i(TAG, "Fetching /native/layout-demo (screen=$screen, action=$action), response code $responseCode")
+            // HttpURLConnection throws FileNotFoundException from
+            // .inputStream on any non-2xx response — the body (here,
+            // public/index.php's {"error": {...}} payload, see its own
+            // set_exception_handler() for this route) only comes back
+            // through .errorStream. Reading the wrong one for a 500 isn't
+            // a network failure at all, but was landing in this method's
+            // own catch block below regardless, which shows
+            // showConnectionError()'s "can't reach the server" card for
+            // what's actually "reached the server fine, it threw" — the
+            // two need different messages, see showScreenErrorOverlay().
+            val stream = if (responseCode >= 400) connection.errorStream else connection.inputStream
+            val json = stream.bufferedReader().use { it.readText() }
             connection.disconnect()
+
+            if (responseCode >= 400) {
+                Handler(Looper.getMainLooper()).post { showScreenErrorOverlay(json) }
+                return
+            }
+
             val roundTripMs = (System.nanoTime() - startNanos) / 1_000_000.0
             val renderTimeMs = Regex("\"renderTimeMs\":([0-9.]+)").find(json)?.groupValues?.get(1)?.toDoubleOrNull()
             Log.i(TAG, "PERF screen=$screen roundTripMs=${"%.1f".format(roundTripMs)} phpRenderTimeMs=${renderTimeMs?.let { "%.2f".format(it) } ?: "?"}")
@@ -1183,6 +1998,146 @@ class NativeRenderPocActivity : AppCompatActivity() {
         connectionErrorView = card
     }
 
+    private var screenErrorView: android.view.View? = null
+
+    /**
+     * public/index.php's /native/layout-demo route replaces its usual
+     * HTML exception handler with a JSON one for exactly this case — see
+     * that route's own set_exception_handler() call for why (an HTML
+     * body under a "application/json" Content-Type header used to fail
+     * to parse silently, leaving whatever was already on screen with no
+     * indication anything broke). Full-screen and scrollable, not a
+     * small centered card like showConnectionError() — a real PHP stack
+     * trace needs room a card can't give it. file/line/trace are only
+     * present when the server's APP_DEBUG is on (same gating the old
+     * HTML error page used) — each row only renders if its field is
+     * actually non-empty, so a production build's generic
+     * class+message-only payload doesn't leave blank rows behind.
+     */
+    private fun showScreenErrorOverlay(json: String) {
+        firstScreenRendered = true // dismiss the splash — see its keepOnScreenCondition above
+
+        val error = try {
+            JSONObject(json).optJSONObject("error")
+        } catch (e: org.json.JSONException) {
+            null
+        }
+        if (error == null) {
+            // Not our own {"error": {...}} shape (a raw 500 from
+            // something outside this route's own control, or a
+            // genuinely malformed response) — nothing structured to
+            // show, fall back to the connection-error card rather than
+            // a blank overlay.
+            showConnectionError()
+            return
+        }
+
+        CrashReporter.logPhpError(this, error)
+
+        screenErrorView?.let { rootLayout.removeView(it) }
+
+        val density = resources.displayMetrics.density
+        fun dp(value: Int) = (value * density).toInt()
+        val danger = android.graphics.Color.parseColor("#DC2626")
+
+        val content = android.widget.LinearLayout(this).apply {
+            orientation = android.widget.LinearLayout.VERTICAL
+            setPadding(dp(24), dp(48), dp(24), dp(48))
+        }
+
+        content.addView(
+            TextView(this).apply {
+                text = "⚠️ Erreur PHP"
+                textSize = 20f
+                setTypeface(typeface, Typeface.BOLD)
+                setTextColor(android.graphics.Color.WHITE)
+            },
+        )
+        content.addView(
+            TextView(this).apply {
+                text = error.optString("class", "Exception")
+                textSize = 15f
+                setTypeface(typeface, Typeface.BOLD)
+                setTextColor(danger)
+                setPadding(0, dp(16), 0, dp(4))
+            },
+        )
+        content.addView(
+            TextView(this).apply {
+                text = error.optString("message", "")
+                textSize = 14f
+                setTextColor(android.graphics.Color.WHITE)
+            },
+        )
+
+        val file = error.optString("file", "")
+        if (file.isNotEmpty()) {
+            val line = error.optInt("line", -1)
+            content.addView(
+                TextView(this).apply {
+                    text = if (line >= 0) "$file:$line" else file
+                    typeface = Typeface.MONOSPACE
+                    textSize = 12f
+                    setTextColor(android.graphics.Color.parseColor("#9CA3AF"))
+                    setPadding(0, dp(12), 0, 0)
+                },
+            )
+        }
+
+        val trace = error.optString("trace", "")
+        if (trace.isNotEmpty()) {
+            content.addView(
+                TextView(this).apply {
+                    text = trace
+                    typeface = Typeface.MONOSPACE
+                    textSize = 11f
+                    setTextColor(android.graphics.Color.parseColor("#D1D5DB"))
+                    setPadding(dp(12), dp(12), dp(12), dp(12))
+                    background = android.graphics.drawable.GradientDrawable().apply {
+                        setColor(android.graphics.Color.parseColor("#1F2937"))
+                        cornerRadius = dp(8).toFloat()
+                    }
+                },
+                android.widget.LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                    topMargin = dp(16)
+                },
+            )
+        }
+
+        val retryButton = TextView(this).apply {
+            text = "Réessayer"
+            textSize = 15f
+            setTypeface(typeface, Typeface.BOLD)
+            setTextColor(android.graphics.Color.WHITE)
+            gravity = Gravity.CENTER
+            setPadding(0, dp(14), 0, dp(14))
+            background = android.graphics.drawable.GradientDrawable().apply {
+                setColor(danger)
+                cornerRadius = dp(24).toFloat()
+            }
+            isClickable = true
+            setOnClickListener {
+                screenErrorView?.let { rootLayout.removeView(it) }
+                screenErrorView = null
+                refetch(action = null, isNavigation = true)
+            }
+        }
+        content.addView(
+            retryButton,
+            android.widget.LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                topMargin = dp(24)
+            },
+        )
+
+        val scrollView = android.widget.ScrollView(this).apply {
+            setBackgroundColor(android.graphics.Color.parseColor("#111827"))
+            addView(content)
+        }
+
+        rootLayout.addView(scrollView, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+        screenErrorView = scrollView
+    }
+
     // A "redirect" field means PHP wants the client on a different screen
     // than the one it just rendered (LoginPage.php's onLogin() returning
     // a path, translated to this architecture — see public/index.php's
@@ -1190,6 +2145,8 @@ class NativeRenderPocActivity : AppCompatActivity() {
     // drawing the stale response.
     private fun applyResponse(json: String, screenWidthDp: Float, isNavigation: Boolean) {
         connectionErrorView?.visibility = android.view.View.GONE
+        screenErrorView?.let { rootLayout.removeView(it) }
+        screenErrorView = null
         if (isNavigation) lastAppliedHash = null
 
         // {"unchanged":true} — PHP determined its output would be byte-
@@ -1220,6 +2177,19 @@ class NativeRenderPocActivity : AppCompatActivity() {
         // need to parse it twice.
         if (json.contains("\"confetti\":true")) {
             showConfettiOverlay()
+        }
+        // Canvas::showSnackbar() — unlike confetti's plain boolean flag,
+        // the message is arbitrary text (could contain quotes, emoji,
+        // anything), which a regex has no business trying to parse
+        // correctly — a real JSONObject parse is the only reliable way
+        // to pull it back out.
+        val snackbar = try {
+            JSONObject(json).optJSONObject("snackbar")
+        } catch (e: org.json.JSONException) {
+            null
+        }
+        if (snackbar != null) {
+            showSnackbarOverlay(snackbar.optString("message"), snackbar.optLong("durationMs", 3000L))
         }
         lastAppliedHash = Regex("\"hash\":\"([0-9a-f]+)\"").find(json)?.groupValues?.get(1)
         if (devToolsPanel != null) updateDevToolsPanel(screenStack.lastOrNull() ?: "?", wasUnchanged = false)
@@ -1302,10 +2272,37 @@ class NativeRenderPocActivity : AppCompatActivity() {
             return
         }
 
-        val screen = intent.getStringExtra("screen") ?: return
+        val screen = deepLinkScreenToken(intent) ?: intent.getStringExtra("screen") ?: return
         clearTextInput()
         screenStack.add(screen)
         refetch(action = null, isNavigation = true)
+    }
+
+    // phpnitro://product?id=42 -> "product?id=42", the exact screenStack
+    // token shape fetchDrawCommands() already knows how to split
+    // ("name?query" — see its own comment above screenToken). A deep link
+    // is just another way to arrive at an ordinary screen, not a separate
+    // code path on the PHP side, same principle as MainActivity's own
+    // deepLinkPath() for the legacy WebView shell. host, not path, holds
+    // the first segment (standard scheme://authority/path parsing —
+    // confirmed against MainActivity's identical case), so the screen
+    // name is read from uri.host / uri.path, and route params from
+    // uri.query — a real query string, not positional path segments (a
+    // deep link's own params use exactly the same "?id=42&tab=reviews"
+    // shape navigate: does, decoded once here, re-encoded once in
+    // fetchDrawCommands() same as any other route param). Returns null
+    // for a non-phpnitro URI, a bare "phpnitro://" with nothing after it,
+    // and deliberately for host="oauth-callback" (handleOAuthCallback()
+    // owns that one).
+    private fun deepLinkScreenToken(intent: Intent?): String? {
+        val uri = intent?.data ?: return null
+        if (uri.scheme != "phpnitro") return null
+        if (uri.host == "oauth-callback") return null
+
+        val screen = "${uri.host.orEmpty()}${uri.path.orEmpty()}".trim('/')
+        if (screen.isEmpty()) return null
+
+        return if (uri.query.isNullOrEmpty()) screen else "$screen?${uri.query}"
     }
 
     // phpnitro://oauth-callback?code=...&state=... (or &error=...) — see
@@ -1415,6 +2412,16 @@ class NativeRenderPocActivity : AppCompatActivity() {
         // Remote mode never constructs phpServer at all (see onCreate()) —
         // ::phpServer.isInitialized guards against UninitializedPropertyAccessException.
         if (::phpServer.isInitialized) phpServer.stop()
+        // Deliberately unbindService() only, never stopService() — the
+        // WebSocket connection was independently STARTED (see
+        // ensureWebSocketServiceBound()), so it keeps running across this
+        // Activity being destroyed (rotation, process death, swiping the
+        // app from recents). Only an explicit "device:wsdisconnect" ever
+        // calls stopService() on it.
+        if (webSocketBound) {
+            unbindService(webSocketConnection)
+            webSocketBound = false
+        }
         super.onDestroy()
     }
 }

@@ -87,6 +87,17 @@ dependencies {
     // web-based translate.google.com widget. Genuinely more "native" than
     // what it replaces, not just a workaround.
     api("com.google.mlkit:translate:17.0.3")
+    // QrScannerButton (Engine\Native\QrScannerButton) — decodes a QR/
+    // barcode from a single captured still (reusing takePicturePreview's
+    // existing Bitmap result, see NativeRenderPocActivity's scanQr
+    // action), not a continuous live-scanning preview. A real live
+    // scanner needs a persistent camera preview surface, which
+    // NativeDeviceBridge.kt's own docblock already names as the one
+    // thing genuinely still WebView-only ("a LIVE camera/mic preview
+    // surface... those stay on the WebView path") — decode-a-still is
+    // the honest scope this native Canvas-only Activity can actually
+    // deliver without that.
+    api("com.google.mlkit:barcode-scanning:17.3.0")
     // RenderLottie — a real com.airbnb.android.lottie.LottieAnimationView
     // overlaid at the widget's rect (same "no Canvas concept for a
     // continuous animation loop, overlay a real Android View instead"
@@ -110,4 +121,25 @@ dependencies {
     // startOAuthFlow() and Engine\SocialAuth\OAuthProvider's own
     // docblock.
     api("androidx.browser:browser:1.8.0")
+    // Engine\Device\InAppReview / Engine\Device\InAppUpdate — Play's own
+    // review sheet and update flow, not custom dialogs pretending to be
+    // them. Play Core's old monolithic artifact is deprecated; these are
+    // its split successors.
+    api("com.google.android.play:review-ktx:2.0.2")
+    api("com.google.android.play:app-update-ktx:2.1.0")
+    // Engine\Device\WebSocket — a real persistent connection (WebSocketService.kt),
+    // not polling in a costume. OkHttp is the standard, battle-tested
+    // Android WebSocket client (java.net.http.WebSocket needs API 26+,
+    // this module's minSdk is 24).
+    api("com.squareup.okhttp3:okhttp:4.12.0")
+    // Engine\Device\ImageCropper — a real interactive crop UI (drag
+    // corners/handles, pinch zoom, aspect-ratio lock). No such gesture
+    // primitive exists in this Canvas-based pipeline (Slider's own
+    // continuous-drag mechanism is 1D; a 2D crop rectangle with resize
+    // handles is a materially bigger primitive), and hand-rolling one
+    // isn't a good use of effort next to a maintained, widely-used
+    // library that already gets this right — same call this framework
+    // already made for chillerlan/php-qrcode (QR encoding) instead of
+    // hand-rolling Reed-Solomon.
+    api("com.vanniktech:android-image-cropper:4.7.0")
 }

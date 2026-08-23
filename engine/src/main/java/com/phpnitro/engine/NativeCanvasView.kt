@@ -13,6 +13,7 @@ import android.graphics.RectF
 import android.graphics.Shader
 import android.graphics.Rect
 import android.graphics.Typeface
+import androidx.core.graphics.ColorUtils
 import android.os.Bundle
 import android.util.Log
 import android.view.GestureDetector
@@ -99,6 +100,14 @@ class NativeCanvasView(context: Context) : View(context) {
     private var fadeAnimator: ValueAnimator? = null
     private var fadeProgress: Float = 1f
 
+    // Canvas::setTransition() — which motion the crossfade above rides
+    // on top of. "fade" (default) is the plain opacity blend this
+    // pipeline always did; slideLeft/slideRight/slideUp add a matching
+    // horizontal/vertical translate, computed in onDraw() from
+    // fadeProgress so it's driven by the exact same animator, no
+    // separate clock.
+    private var transitionType: String = "fade"
+
     // Hero FLIP transition (Canvas::beginHero()/heroRegions in the
     // JSON payload): heroRegions is this render's {tag: rect} map;
     // previousHeroRegions is the prior render's. A tag present in both at
@@ -124,6 +133,11 @@ class NativeCanvasView(context: Context) : View(context) {
     // loop.
     private var spinnerAnimator: ValueAnimator? = null
 
+    // Drives drawSkeletonCommand()'s continuous shimmer sweep — same
+    // "started the first time the relevant command type appears, stopped
+    // the moment none remain" lifecycle as spinnerAnimator right above.
+    private var skeletonAnimator: ValueAnimator? = null
+
     private fun updateSpinnerAnimator() {
         val hasSpinner = (0 until commands.length()).any { commands.getJSONObject(it).optString("type") == "spinner" }
         if (hasSpinner) {
@@ -141,10 +155,35 @@ class NativeCanvasView(context: Context) : View(context) {
         }
     }
 
+    // Same started/stopped-on-demand idea as updateSpinnerAnimator()
+    // right above, for Skeleton's shimmer sweep instead of Spinner's
+    // rotation — a screen with no Skeleton on it never pays for a
+    // perpetual redraw loop.
+    private fun updateSkeletonAnimator() {
+        val hasSkeleton = (0 until commands.length()).any { commands.getJSONObject(it).optString("type") == "skeleton" }
+        if (hasSkeleton) {
+            if (skeletonAnimator == null) {
+                skeletonAnimator = ValueAnimator.ofFloat(0f, 1f).apply {
+                    duration = 16
+                    repeatCount = ValueAnimator.INFINITE
+                    addUpdateListener { invalidate() }
+                    start()
+                }
+            }
+        } else {
+            skeletonAnimator?.cancel()
+            skeletonAnimator = null
+        }
+    }
+
     override fun onDetachedFromWindow() {
         super.onDetachedFromWindow()
         spinnerAnimator?.cancel()
         spinnerAnimator = null
+        skeletonAnimator?.cancel()
+        skeletonAnimator = null
+        pullSpinAnimator?.cancel()
+        pullSpinAnimator = null
     }
     private var heroProgress: Float = 1f
     private var activeHeroFlights: Map<String, Pair<RectF, RectF>> = emptyMap()
@@ -178,6 +217,24 @@ class NativeCanvasView(context: Context) : View(context) {
 
     /** Current scroll position in dp — NativeRenderPocActivity reports this on every fetch. */
     val currentScrollYDp: Float get() = scrollY
+
+    // Pull-to-refresh (Canvas::setPullToRefresh()) — an overscroll-at-top
+    // drag, tracked entirely client-side same as Dismissible/BottomSheet's
+    // handle: pullOffsetY (dp) grows under the finger with resistance
+    // while scrollY is already 0, a small indicator overlay (see
+    // drawPullToRefreshIndicator()) grows with it, and only past
+    // PULL_TRIGGER_DISTANCE on release does $action actually fire — PHP
+    // never sees the drag itself. null (the default) means this screen
+    // never opted in, so every check below is a cheap null-comparison
+    // no-op for the vast majority of screens that don't use this.
+    private var pullToRefreshAction: String? = null
+    private var pullOffsetY = 0f
+    private var isRefreshing = false
+    private var pullSettleAnimator: ValueAnimator? = null
+    private var pullSpinAnimator: ValueAnimator? = null
+    private val pullTriggerDistance = 64f
+    private val pullMaxDistance = 100f
+    private val pullRestDistance = 56f
 
     private fun checkScrollFollow() {
         if (!scrollFollow) return
@@ -247,6 +304,19 @@ class NativeCanvasView(context: Context) : View(context) {
     // only fills in keys this map doesn't already have.
     private val clientTabState = mutableMapOf<String, Int>()
 
+    // Cross-fade between the previously selected panel and the newly
+    // selected one — same alpha-compositing idea as drawCommands()'s
+    // whole-screen fadeProgress (see the previous/current pass around line
+    // 1958), just applied locally to one ClientTabs group's own two
+    // panels instead of the entire screen. Absent from this map = commit
+    // straight to clientTabState, no animation (BottomSheet's slide is a
+    // separate, already-animated mechanism — see sheetAnimatedOffsetY —
+    // so a key with a registered sheetHandleRegion never goes through
+    // this map at all, setClientTab() branches before it's ever touched).
+    private data class TabCrossfade(val fromIndex: Int, val toIndex: Int, var progress: Float = 0f)
+    private val clientTabCrossfade = mutableMapOf<String, TabCrossfade>()
+    private val clientTabCrossfadeAnimators = mutableMapOf<String, ValueAnimator>()
+
     // HorizontalScroll (Canvas::horizontalScroll()) — a nested scroll
     // region with its own local offset, independent of the outer page
     // scroll (scrollY below). hScrollOffsets follows clientTabState's exact
@@ -260,6 +330,23 @@ class NativeCanvasView(context: Context) : View(context) {
     private val hScrollOffsets = mutableMapOf<String, Float>()
     private var pendingHScroll: HScrollRegion? = null
     private var activeHScroll: HScrollRegion? = null
+
+    // NestedScroll (Canvas::verticalScroll()) — the vertical counterpart
+    // to HScrollRegion right above, with one real difference: both this
+    // and the outer page scroll move on the SAME axis, so there's no
+    // horizontal-vs-vertical split to arbitrate a drag with. A drag
+    // starting inside a registered region's rect claims the gesture for
+    // it, but only up to that region's own top/bottom edge — once
+    // reached, the excess delta bubbles to the outer page scroll for the
+    // rest of that same gesture (see the ACTION_MOVE handling below).
+    // Only ONE level of nesting either way (a NestedScroll inside another
+    // NestedScroll isn't arbitrated) — full multi-level bubbling like
+    // Flutter's NestedScrollView isn't implemented, just this one level.
+    private data class VScrollRegion(val key: String, val rect: RectF, val contentHeight: Float, val viewportHeight: Float)
+    private var vScrollRegions: List<VScrollRegion> = emptyList()
+    private val vScrollOffsets = mutableMapOf<String, Float>()
+    private var pendingVScroll: VScrollRegion? = null
+    private var activeVScroll: VScrollRegion? = null
 
     // Slider (Canvas::slider()) — same "own the drag entirely client-side,
     // commit once on release" split as the three regions above, but there's
@@ -276,6 +363,25 @@ class NativeCanvasView(context: Context) : View(context) {
     private val sliderValues = mutableMapOf<String, Float>()
     private var activeSlider: SliderRegion? = null
 
+    // BottomSheet's grab handle (Canvas::sheetHandle()) — same continuous-
+    // drag split as Dismissible, applied to a vertical drag-to-close
+    // instead of a horizontal swipe. sheetDragOffsetY is dp dragged DOWN
+    // so far (0 = fully open, clamped at the sheet's own height = fully
+    // closed); only ever non-zero while a drag on THIS key's handle is
+    // active. sheetAnimatedOffsetY is the separate tween setClientTab()
+    // below drives for a TAP-triggered open/close (the button, the scrim,
+    // a real "Fermer") — the two never run at once for the same key (a
+    // drag can't start until the sheet has finished animating open, since
+    // hitTestSheetHandle() only matches a key already fully at index 1).
+    private data class SheetHandleRegion(val key: String, val rect: RectF, val sheetHeight: Float, val closeAction: String)
+    private var sheetHandleRegions: List<SheetHandleRegion> = emptyList()
+    private var pendingSheetDrag: SheetHandleRegion? = null
+    private var activeSheetDrag: SheetHandleRegion? = null
+    private var sheetDragOffsetY = 0f
+    private var sheetDragSettleAnimator: ValueAnimator? = null
+    private val sheetAnimatedOffsetY = mutableMapOf<String, Float>()
+    private val sheetOpenCloseAnimators = mutableMapOf<String, ValueAnimator>()
+
     private fun seedClientTabState(list: JSONArray) {
         for (index in 0 until list.length()) {
             val command = list.getJSONObject(index)
@@ -288,10 +394,89 @@ class NativeCanvasView(context: Context) : View(context) {
         }
     }
 
-    /** Called by NativeRenderPocActivity for a "clientTab:key:index" tap — no refetch, ever. */
+    /**
+     * Called by NativeRenderPocActivity for a "clientTab:key:index" tap —
+     * no refetch, ever. A key with a registered sheetHandle (a
+     * BottomSheet) slides instead of snapping: opening (0 -> 1) starts
+     * fully below the screen and tweens up to its rest position; closing
+     * (1 -> 0) tweens down from wherever it currently sits (its rest
+     * position, or partway through an interrupted drag) and only flips
+     * clientTabState once that animation finishes — so drawClientPanelCommand()
+     * keeps drawing the "open" panel throughout the close animation
+     * instead of it vanishing instantly while still visually mid-slide.
+     * Every other clientTab key (ClientTabs, HorizontalScroll's discrete
+     * states) cross-fades instead of snapping — see clientTabCrossfade
+     * above and drawClientPanelCommand()'s use of it.
+     */
     fun setClientTab(key: String, index: Int) {
-        clientTabState[key] = index
-        invalidate()
+        val sheet = sheetHandleRegions.firstOrNull { it.key == key }
+        if (sheet == null) {
+            val current = clientTabState[key]
+            if (current == null || current == index) {
+                clientTabState[key] = index
+                invalidate()
+                return
+            }
+            clientTabCrossfadeAnimators[key]?.cancel()
+            val fade = TabCrossfade(fromIndex = current, toIndex = index)
+            clientTabCrossfade[key] = fade
+            clientTabCrossfadeAnimators[key] = ValueAnimator.ofFloat(0f, 1f).apply {
+                duration = 160
+                interpolator = DecelerateInterpolator()
+                addUpdateListener {
+                    fade.progress = it.animatedValue as Float
+                    invalidate()
+                }
+                addListener(object : android.animation.AnimatorListenerAdapter() {
+                    override fun onAnimationEnd(animation: android.animation.Animator) {
+                        clientTabState[key] = index
+                        clientTabCrossfade.remove(key)
+                        invalidate()
+                    }
+                })
+                start()
+            }
+            return
+        }
+
+        if (index == clientTabState[key]) {
+            clientTabState[key] = index
+            invalidate()
+            return
+        }
+
+        sheetOpenCloseAnimators[key]?.cancel()
+        if (index == 1) {
+            clientTabState[key] = 1
+            sheetAnimatedOffsetY[key] = sheet.sheetHeight
+            sheetOpenCloseAnimators[key] = ValueAnimator.ofFloat(sheet.sheetHeight, 0f).apply {
+                duration = 220
+                interpolator = DecelerateInterpolator()
+                addUpdateListener {
+                    sheetAnimatedOffsetY[key] = it.animatedValue as Float
+                    invalidate()
+                }
+                start()
+            }
+        } else {
+            val from = sheetAnimatedOffsetY[key] ?: 0f
+            sheetOpenCloseAnimators[key] = ValueAnimator.ofFloat(from, sheet.sheetHeight).apply {
+                duration = 220
+                interpolator = DecelerateInterpolator()
+                addUpdateListener {
+                    sheetAnimatedOffsetY[key] = it.animatedValue as Float
+                    invalidate()
+                }
+                addListener(object : android.animation.AnimatorListenerAdapter() {
+                    override fun onAnimationEnd(animation: android.animation.Animator) {
+                        clientTabState[key] = 0
+                        sheetAnimatedOffsetY[key] = 0f
+                        invalidate()
+                    }
+                })
+                start()
+            }
+        }
     }
 
     // DevTools overlay readouts — set at the end of setCommands(), read
@@ -378,12 +563,23 @@ class NativeCanvasView(context: Context) : View(context) {
             contentHeight = payload.optDouble("contentHeight", 0.0).toFloat()
             lastScreenWidthDp = screenWidthDp
             scrollFollow = payload.optBoolean("scrollFollow", false)
+            transitionType = payload.optString("transition", "fade")
+            pullToRefreshAction = payload.optString("pullToRefresh", "").ifEmpty { null }
+            // The refetch this pull triggered just landed — let the
+            // indicator finish its spin-down instead of freezing mid-spin
+            // or vanishing the instant the response arrives, whichever of
+            // those happened to line up with this exact frame.
+            if (isRefreshing) {
+                isRefreshing = false
+                animatePullTo(0f)
+            }
             scrollY = scrollY.coerceIn(0f, maxScrollY())
             lastFetchedScrollY = scrollY
 
             previousCommands = if (commands.length() > 0) commands else null
             commands = newCommands
             updateSpinnerAnimator()
+            updateSkeletonAnimator()
 
             previousHeroRegions = if (heroRegions.isNotEmpty()) heroRegions else null
             heroRegions = parseHeroRegions(payload.optJSONArray("heroRegions"))
@@ -395,10 +591,12 @@ class NativeCanvasView(context: Context) : View(context) {
             reorderAnimatedY.clear()
             lottieRegions = parseLottieRegions(payload.optJSONArray("lottieRegions"))
             hScrollRegions = parseHScrollRegions(commands)
+            vScrollRegions = parseVScrollRegions(commands)
             sliderRegions = parseSliderRegions(payload.optJSONArray("sliderRegions"))
             for (region in sliderRegions) {
                 if (!sliderValues.containsKey(region.key)) sliderValues[region.key] = region.serverValue
             }
+            sheetHandleRegions = parseSheetHandleRegions(payload.optJSONArray("sheetRegions"))
             seedClientTabState(commands)
             rebuildAccessibilityNodes()
             lastCommandCount = commands.length()
@@ -534,6 +732,19 @@ class NativeCanvasView(context: Context) : View(context) {
         return result
     }
 
+    private fun parseSheetHandleRegions(array: JSONArray?): List<SheetHandleRegion> {
+        if (array == null) return emptyList()
+        val result = mutableListOf<SheetHandleRegion>()
+        for (index in 0 until array.length()) {
+            val region = array.getJSONObject(index)
+            val left = region.getDouble("x").toFloat()
+            val top = region.getDouble("y").toFloat()
+            val rect = RectF(left, top, left + region.getDouble("width").toFloat(), top + region.getDouble("height").toFloat())
+            result.add(SheetHandleRegion(region.getString("key"), rect, region.getDouble("sheetHeight").toFloat(), region.getString("closeAction")))
+        }
+        return result
+    }
+
     /** hScroll commands live inline in `commands` (see drawHScrollCommand()), not a dedicated top-level array like dismissRegions/reorderRegions. */
     private fun parseHScrollRegions(list: JSONArray): List<HScrollRegion> {
         val result = mutableListOf<HScrollRegion>()
@@ -546,6 +757,21 @@ class NativeCanvasView(context: Context) : View(context) {
             val height = command.getDouble("height").toFloat()
             val rect = RectF(left, top, left + width, top + height)
             result.add(HScrollRegion(command.getString("key"), rect, command.getDouble("contentWidth").toFloat(), width))
+        }
+        return result
+    }
+
+    private fun parseVScrollRegions(list: JSONArray): List<VScrollRegion> {
+        val result = mutableListOf<VScrollRegion>()
+        for (index in 0 until list.length()) {
+            val command = list.getJSONObject(index)
+            if (command.optString("type") != "vScroll") continue
+            val left = command.getDouble("x").toFloat()
+            val top = command.getDouble("y").toFloat()
+            val width = command.getDouble("width").toFloat()
+            val height = command.getDouble("height").toFloat()
+            val rect = RectF(left, top, left + width, top + height)
+            result.add(VScrollRegion(command.getString("key"), rect, command.getDouble("contentHeight").toFloat(), height))
         }
         return result
     }
@@ -689,8 +915,27 @@ class NativeCanvasView(context: Context) : View(context) {
         drawSingleCommand(canvas, blended, 1f)
     }
 
+    // The extension point a third-party PHP package (or app-specific
+    // widget) uses to add a genuinely new native drawing without
+    // patching this engine module at all: Canvas::custom($type, $data)
+    // emits {"type": "custom:$type", ...$data}, and whoever owns the
+    // consuming Activity (NativeRenderPocActivity, or literally anyone
+    // with a reference to this View) calls
+    // registerCustomCommandHandler($type, handler) once — see
+    // NativeRenderPocActivity's own "sparkline" registration for the
+    // real, wired example, a widget this engine module's own code has
+    // zero knowledge of. Every OTHER draw command type above is still
+    // built into the engine directly (they're the framework's own
+    // primitives, not third-party); this is only for what isn't.
+    private val customCommandHandlers = mutableMapOf<String, (Canvas, JSONObject, Float) -> Unit>()
+
+    fun registerCustomCommandHandler(type: String, handler: (canvas: Canvas, command: JSONObject, alpha: Float) -> Unit) {
+        customCommandHandlers[type] = handler
+    }
+
     private fun drawSingleCommand(canvas: Canvas, command: JSONObject, alpha: Float) {
-        when (command.getString("type")) {
+        val type = command.getString("type")
+        when (type) {
             "rect" -> drawRectCommand(canvas, command, alpha)
             "text" -> drawTextCommand(canvas, command, alpha)
             "icon" -> drawIconCommand(canvas, command, alpha)
@@ -700,8 +945,13 @@ class NativeCanvasView(context: Context) : View(context) {
             "arc" -> drawArcCommand(canvas, command, alpha)
             "clientPanel" -> drawClientPanelCommand(canvas, command, alpha)
             "hScroll" -> drawHScrollCommand(canvas, command, alpha)
+            "vScroll" -> drawVScrollCommand(canvas, command, alpha)
             "spinner" -> drawSpinnerCommand(canvas, command, alpha)
             "slider" -> drawSliderCommand(canvas, command, alpha)
+            "skeleton" -> drawSkeletonCommand(canvas, command, alpha)
+            else -> if (type.startsWith("custom:")) {
+                customCommandHandlers[type.removePrefix("custom:")]?.invoke(canvas, command, alpha)
+            }
         }
     }
 
@@ -787,18 +1037,83 @@ class NativeCanvasView(context: Context) : View(context) {
         canvas.drawArc(rect, rotation, 110f, false, sweepPaint)
     }
 
-    // Only the panel whose index matches this group's current local
+    // Base fill + a translucent band sweeping left-to-right on a loop —
+    // the highlight is the base color blended toward white rather than a
+    // flat white, so it reads right in dark mode too (a hard white
+    // highlight would blow out against an already-light border() base
+    // there). Driven by SystemClock.uptimeMillis() exactly like
+    // drawSpinnerCommand()'s rotation, no state travels with the command
+    // itself — see updateSkeletonAnimator() for the started/stopped-on-
+    // demand invalidate() loop this needs to actually animate.
+    private fun drawSkeletonCommand(canvas: Canvas, command: JSONObject, alpha: Float) {
+        val x = command.getDouble("x").toFloat()
+        val y = command.getDouble("y").toFloat()
+        val w = command.getDouble("width").toFloat()
+        val h = command.getDouble("height").toFloat()
+        val radius = command.getDouble("radius").toFloat()
+        val baseColor = Color.parseColor(command.getString("color"))
+        val rect = RectF(x, y, x + w, y + h)
+
+        val basePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = baseColor
+            this.alpha = (this.alpha * alpha).toInt()
+        }
+        canvas.drawRoundRect(rect, radius, radius, basePaint)
+
+        val highlight = ColorUtils.blendARGB(baseColor, Color.WHITE, 0.5f)
+        val sweepWidth = (w * 0.6f).coerceAtLeast(1f)
+        val periodMs = 1300f
+        val phase = (android.os.SystemClock.uptimeMillis() % periodMs.toLong()) / periodMs
+        val sweepX = x - sweepWidth + (w + sweepWidth) * phase
+
+        val shimmerPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            shader = LinearGradient(
+                sweepX, y, sweepX + sweepWidth, y,
+                intArrayOf(Color.TRANSPARENT, highlight, Color.TRANSPARENT),
+                floatArrayOf(0f, 0.5f, 1f),
+                Shader.TileMode.CLAMP,
+            )
+            this.alpha = (this.alpha * alpha * 0.8f).toInt()
+        }
+        val saved = canvas.save()
+        canvas.clipRect(rect)
+        canvas.drawRoundRect(rect, radius, radius, shimmerPaint)
+        canvas.restoreToCount(saved)
+    }
+
+    // Normally only the panel matching this group's current local
     // selection draws — every other panel this same command list carries
-    // (there's one clientPanel command per ClientTabs panel, all
-    // sharing the same rect) is skipped outright, same idea as the
-    // dismiss/reorder key checks in drawCommands() just above.
+    // (there's one clientPanel command per ClientTabs panel, all sharing
+    // the same rect) is skipped outright, same idea as the dismiss/reorder
+    // key checks in drawCommands() just above. Mid cross-fade (see
+    // clientTabCrossfade / setClientTab()), BOTH the outgoing and incoming
+    // panel draw at once, opposite alphas, exactly like drawCommands()'s
+    // own previous/current screen-transition pass — just scoped to this
+    // one panel's rect instead of the whole canvas.
     private fun drawClientPanelCommand(canvas: Canvas, command: JSONObject, alpha: Float) {
-        if (clientTabState[command.getString("key")] != command.getInt("index")) return
+        val key = command.getString("key")
+        val panelIndex = command.getInt("index")
+        val crossfade = clientTabCrossfade[key]
+        val panelAlpha = when {
+            crossfade != null && panelIndex == crossfade.fromIndex -> alpha * (1f - crossfade.progress)
+            crossfade != null && panelIndex == crossfade.toIndex -> alpha * crossfade.progress
+            crossfade == null && clientTabState[key] == panelIndex -> alpha
+            else -> return
+        }
+        if (panelAlpha <= 0f) return
         val saved = canvas.save()
         canvas.translate(command.getDouble("x").toFloat(), command.getDouble("y").toFloat())
+        // BottomSheet's own slide: setClientTab()'s open/close tween
+        // (sheetAnimatedOffsetY) plus, if the user is CURRENTLY dragging
+        // this exact sheet's handle, the live drag distance on top of it —
+        // both are 0 outside those two cases, so every other clientPanel
+        // (ClientTabs, HorizontalScroll's tab-like states) draws exactly
+        // as before.
+        val sheetOffset = (sheetAnimatedOffsetY[key] ?: 0f) + if (activeSheetDrag?.key == key) sheetDragOffsetY else 0f
+        if (sheetOffset != 0f) canvas.translate(0f, sheetOffset)
         val nested = command.getJSONArray("commands")
         for (index in 0 until nested.length()) {
-            drawSingleCommand(canvas, nested.getJSONObject(index), alpha)
+            drawSingleCommand(canvas, nested.getJSONObject(index), panelAlpha)
         }
         canvas.restoreToCount(saved)
     }
@@ -830,6 +1145,25 @@ class NativeCanvasView(context: Context) : View(context) {
         canvas.restoreToCount(saved)
     }
 
+    // Vertical counterpart to drawHScrollCommand() right above — same
+    // clip-then-translate shape, just along the other axis.
+    private fun drawVScrollCommand(canvas: Canvas, command: JSONObject, alpha: Float) {
+        val key = command.getString("key")
+        val x = command.getDouble("x").toFloat()
+        val y = command.getDouble("y").toFloat()
+        val w = command.getDouble("width").toFloat()
+        val h = command.getDouble("height").toFloat()
+        val offset = vScrollOffsets[key] ?: 0f
+        val saved = canvas.save()
+        canvas.clipRect(x, y, x + w, y + h)
+        canvas.translate(x, y - offset)
+        val nested = command.getJSONArray("commands")
+        for (index in 0 until nested.length()) {
+            drawSingleCommand(canvas, nested.getJSONObject(index), alpha)
+        }
+        canvas.restoreToCount(saved)
+    }
+
     private fun lerp(from: Float, to: Float, progress: Float): Float = from + (to - from) * progress
 
     override fun onTouchEvent(event: MotionEvent): Boolean {
@@ -848,6 +1182,8 @@ class NativeCanvasView(context: Context) : View(context) {
                 scrollAnimator?.cancel()
                 dismissSettleAnimator?.cancel()
                 reorderSettleAnimator?.cancel()
+                sheetDragSettleAnimator?.cancel()
+                pullSettleAnimator?.cancel()
                 touchDownX = event.x
                 touchDownY = event.y
                 lastTouchX = event.x
@@ -855,6 +1191,8 @@ class NativeCanvasView(context: Context) : View(context) {
                 isDragging = false
                 pendingDismiss = if (activeDismiss == null && activeReorder == null) hitTestDismiss(event) else null
                 pendingHScroll = if (activeHScroll == null && activeReorder == null) hitTestHScroll(event) else null
+                pendingSheetDrag = if (activeSheetDrag == null && activeReorder == null) hitTestSheetHandle(event) else null
+                pendingVScroll = if (activeVScroll == null && activeReorder == null) hitTestVScroll(event) else null
                 // Slider commits immediately on DOWN, not after a
                 // decisive-move threshold like dismiss/hScroll — a
                 // slider's whole surface (its 44dp touch box) IS the
@@ -909,6 +1247,37 @@ class NativeCanvasView(context: Context) : View(context) {
                     // scroll for the rest of this gesture.
                     activeDismiss = pendingDismiss
                     pendingDismiss = null
+                    pendingSheetDrag = null
+                } else if (activeSheetDrag == null && pendingSheetDrag != null && !isDragging &&
+                    abs(totalDeltaY) > touchSlop && abs(totalDeltaY) > abs(totalDeltaX)
+                ) {
+                    // First decisive move was vertical, starting on the
+                    // sheet's own grab handle — commit to a sheet drag
+                    // instead of the generic page scroll below. The
+                    // opposite of dismiss/hScroll's own disambiguation
+                    // (those want HORIZONTAL to confirm, vertical to bail);
+                    // this one wants vertical to confirm.
+                    activeSheetDrag = pendingSheetDrag
+                    pendingSheetDrag = null
+                    pendingDismiss = null
+                    pendingHScroll = null
+                } else if (activeVScroll == null && pendingVScroll != null && !isDragging &&
+                    abs(totalDeltaY) > touchSlop
+                ) {
+                    // A drag starting inside a NestedScroll's own rect
+                    // claims the whole gesture for it — see
+                    // Canvas::verticalScroll()'s docblock for why this
+                    // doesn't try to bubble to the outer page scroll once
+                    // the nested content hits its own edge. No axis
+                    // comparison against totalDeltaX needed here (unlike
+                    // dismiss/hScroll's horizontal claim): being spatially
+                    // inside the region already disambiguates it from
+                    // anything else this touch could have meant.
+                    activeVScroll = pendingVScroll
+                    pendingVScroll = null
+                    pendingDismiss = null
+                    pendingHScroll = null
+                    pendingSheetDrag = null
                 } else if (!isDragging && (pendingDismiss != null || pendingHScroll != null) &&
                     abs(totalDeltaY) > touchSlop && abs(totalDeltaY) > abs(totalDeltaX)
                 ) {
@@ -927,16 +1296,78 @@ class NativeCanvasView(context: Context) : View(context) {
                 } else if (activeDismiss != null) {
                     dismissOffsetX = totalDeltaX / density
                     invalidate()
+                } else if (activeSheetDrag != null) {
+                    // Downward-only — dragging UP past the sheet's rest
+                    // position isn't a gesture this modal shape supports
+                    // (no "overscroll" to peek past full-open), so this
+                    // clamps at 0 the same way dismissOffsetX above has no
+                    // floor/ceiling of its own (a dismiss can go either
+                    // direction, a sheet only closes downward).
+                    sheetDragOffsetY = (totalDeltaY / density).coerceIn(0f, activeSheetDrag!!.sheetHeight)
+                    invalidate()
+                } else if (activeVScroll != null) {
+                    val region = activeVScroll!!
+                    val deltaDp = (lastTouchY - event.y) / density
+                    val maxOffset = (region.contentHeight - region.viewportHeight).coerceAtLeast(0f)
+                    val current = vScrollOffsets[region.key] ?: 0f
+                    val next = current + deltaDp
+                    if (next < 0f || next > maxOffset) {
+                        // The nested region just hit its own top/bottom edge
+                        // — only the EXCESS beyond that edge (not the whole
+                        // delta) bubbles to the outer page scroll, so the
+                        // handoff has no dead zone (see Canvas::
+                        // verticalScroll()'s docblock, which documented this
+                        // exact gap as a real scope boundary before this
+                        // fix). Once handed off, the REST of this gesture
+                        // (through ACTION_UP) stays with the page scroll
+                        // rather than re-arbitrating every frame — avoids a
+                        // flicker if the finger hovers right at the edge.
+                        val excess = if (next < 0f) next else next - maxOffset
+                        vScrollOffsets[region.key] = current.coerceIn(0f, maxOffset)
+                        activeVScroll = null
+                        isDragging = true
+                        scrollY = (scrollY + excess).coerceIn(0f, maxScroll)
+                        lastTouchY = event.y
+                        checkScrollFollow()
+                    } else {
+                        vScrollOffsets[region.key] = next
+                        lastTouchY = event.y
+                    }
+                    invalidate()
                 } else {
-                    if (!isDragging && maxScroll > 0f && abs(totalDeltaY) > touchSlop && abs(totalDeltaY) > abs(totalDeltaX)) {
+                    // Pull-to-refresh's own "should this gesture even start
+                    // dragging" case: a short/empty screen has maxScroll==0
+                    // and would otherwise never enter isDragging at all,
+                    // but a pull still has to work there (nothing to
+                    // scroll isn't the same as nothing to refresh).
+                    if (!isDragging && (maxScroll > 0f || (pullToRefreshAction != null && scrollY <= 0f)) &&
+                        abs(totalDeltaY) > touchSlop && abs(totalDeltaY) > abs(totalDeltaX)
+                    ) {
                         isDragging = true
                     }
                     if (isDragging) {
                         val deltaDp = (lastTouchY - event.y) / density
-                        scrollY = (scrollY + deltaDp).coerceIn(0f, maxScroll)
-                        lastTouchY = event.y
-                        checkScrollFollow()
-                        invalidate()
+                        // Once a pull has actually started (pullOffsetY >
+                        // 0), EVERY further sample keeps adjusting it —
+                        // including a partial reversal back toward 0 — so
+                        // pushing back up doesn't instantly snap into a
+                        // page scroll mid-gesture. A fresh pull only
+                        // starts at the top (scrollY <= 0) dragging further
+                        // down (deltaDp < 0, this file's own sign
+                        // convention — see scrollY's identical formula
+                        // right below).
+                        if (pullToRefreshAction != null && !isRefreshing &&
+                            (pullOffsetY > 0f || (scrollY <= 0f && deltaDp < 0f))
+                        ) {
+                            pullOffsetY = (pullOffsetY - deltaDp * 0.5f).coerceIn(0f, pullMaxDistance)
+                            lastTouchY = event.y
+                            invalidate()
+                        } else {
+                            scrollY = (scrollY + deltaDp).coerceIn(0f, maxScroll)
+                            lastTouchY = event.y
+                            checkScrollFollow()
+                            invalidate()
+                        }
                     }
                 }
             }
@@ -946,8 +1377,12 @@ class NativeCanvasView(context: Context) : View(context) {
                     settleReorder()
                 } else if (activeDismiss != null) {
                     settleDismiss()
+                } else if (activeSheetDrag != null) {
+                    settleSheetDrag()
                 } else if (activeHScroll != null) {
                     activeHScroll = null
+                } else if (activeVScroll != null) {
+                    activeVScroll = null
                 } else if (activeSlider != null) {
                     val region = activeSlider!!
                     val finalValue = sliderValueForTouch(region, event.x)
@@ -963,6 +1398,8 @@ class NativeCanvasView(context: Context) : View(context) {
                     // this exact slider on a fr-FR device and watching the
                     // server echo back 0.00 for a real ~0.82 drag.
                     onAction?.invoke(region.action, region.rect, JSONObject().put("next", String.format(java.util.Locale.US, "%.3f", finalValue)))
+                } else if (pullOffsetY > 0f) {
+                    settlePull()
                 } else if (isDragging) {
                     velocityTracker?.let {
                         it.addMovement(event)
@@ -974,6 +1411,8 @@ class NativeCanvasView(context: Context) : View(context) {
                 }
                 pendingDismiss = null
                 pendingHScroll = null
+                pendingSheetDrag = null
+                pendingVScroll = null
                 velocityTracker?.recycle()
                 velocityTracker = null
             }
@@ -984,11 +1423,20 @@ class NativeCanvasView(context: Context) : View(context) {
                 }
                 activeHScroll = null
                 pendingHScroll = null
+                activeVScroll = null
+                pendingVScroll = null
                 activeSlider = null
                 if (activeDismiss != null) {
                     springBackDismiss()
                 }
+                if (activeSheetDrag != null) {
+                    springBackSheetDrag()
+                }
+                if (pullOffsetY > 0f && !isRefreshing) {
+                    animatePullTo(0f)
+                }
                 pendingDismiss = null
+                pendingSheetDrag = null
                 velocityTracker?.recycle()
                 velocityTracker = null
             }
@@ -1113,10 +1561,34 @@ class NativeCanvasView(context: Context) : View(context) {
         }
     }
 
+    // Screen-relative (fixed: true, see Canvas::sheetHandle()'s docblock)
+    // — raw touchY, no scrollY added, same treatment as any other Fixed
+    // region (handleTap()'s own comment explains why). Only matches a
+    // sheet that's actually fully open: a closed or still-mid-animation-
+    // open sheet has nothing worth grabbing yet.
+    private fun hitTestSheetHandle(event: MotionEvent): SheetHandleRegion? {
+        val touchX = event.x / density
+        val touchY = event.y / density
+        return sheetHandleRegions.firstOrNull { region ->
+            clientTabState[region.key] == 1 &&
+                touchX >= region.rect.left && touchX <= region.rect.right &&
+                touchY >= region.rect.top && touchY <= region.rect.bottom
+        }
+    }
+
     private fun hitTestHScroll(event: MotionEvent): HScrollRegion? {
         val touchX = event.x / density
         val touchY = event.y / density + scrollY
         return hScrollRegions.firstOrNull { region ->
+            touchX >= region.rect.left && touchX <= region.rect.right &&
+                touchY >= region.rect.top && touchY <= region.rect.bottom
+        }
+    }
+
+    private fun hitTestVScroll(event: MotionEvent): VScrollRegion? {
+        val touchX = event.x / density
+        val touchY = event.y / density + scrollY
+        return vScrollRegions.firstOrNull { region ->
             touchX >= region.rect.left && touchX <= region.rect.right &&
                 touchY >= region.rect.top && touchY <= region.rect.bottom
         }
@@ -1191,6 +1663,123 @@ class NativeCanvasView(context: Context) : View(context) {
             })
             start()
         }
+    }
+
+    // Past threshold: finish the slide down to fully closed, THEN flip
+    // clientTabState — same "animate first, commit state after" order as
+    // settleDismiss(), so the sheet visually finishes leaving before it's
+    // gone. No onAction call: closing was always local-only (setClientTab()
+    // handles the "clientTab:key:0" a tap-driven close sends the exact
+    // same way), a drag-commit just reaches that same end state a
+    // different way.
+    private fun settleSheetDrag() {
+        val region = activeSheetDrag ?: return
+        val threshold = region.sheetHeight * 0.3f
+        if (sheetDragOffsetY <= threshold) {
+            springBackSheetDrag()
+            return
+        }
+        sheetDragSettleAnimator?.cancel()
+        sheetDragSettleAnimator = ValueAnimator.ofFloat(sheetDragOffsetY, region.sheetHeight).apply {
+            duration = 180
+            interpolator = DecelerateInterpolator()
+            addUpdateListener {
+                sheetDragOffsetY = it.animatedValue as Float
+                invalidate()
+            }
+            addListener(object : android.animation.AnimatorListenerAdapter() {
+                override fun onAnimationEnd(animation: android.animation.Animator) {
+                    clientTabState[region.key] = 0
+                    activeSheetDrag = null
+                    sheetDragOffsetY = 0f
+                    invalidate()
+                    performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
+                }
+            })
+            start()
+        }
+    }
+
+    private fun springBackSheetDrag() {
+        activeSheetDrag ?: return
+        sheetDragSettleAnimator?.cancel()
+        sheetDragSettleAnimator = ValueAnimator.ofFloat(sheetDragOffsetY, 0f).apply {
+            duration = 180
+            interpolator = DecelerateInterpolator()
+            addUpdateListener {
+                sheetDragOffsetY = it.animatedValue as Float
+                invalidate()
+            }
+            addListener(object : android.animation.AnimatorListenerAdapter() {
+                override fun onAnimationEnd(animation: android.animation.Animator) {
+                    activeSheetDrag = null
+                    sheetDragOffsetY = 0f
+                    invalidate()
+                }
+            })
+            start()
+        }
+    }
+
+    // Past threshold: hold the indicator at pullRestDistance (not 0 — it
+    // needs to stay visible and spinning while $action's refetch is in
+    // flight) and fire $action. setCommands() above is what actually
+    // clears isRefreshing and animates back to 0 once that refetch's
+    // response lands — no onAction call here decides success/failure,
+    // same "PHP never sees the gesture, only its outcome" split as every
+    // other drag in this file, just with the "outcome" being an ordinary
+    // action string instead of a settle/spring choice.
+    private fun settlePull() {
+        if (pullOffsetY >= pullTriggerDistance && pullToRefreshAction != null) {
+            isRefreshing = true
+            performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
+            animatePullTo(pullRestDistance)
+            startPullSpin()
+            onAction?.invoke(pullToRefreshAction!!, RectF(0f, 0f, 0f, 0f), null)
+        } else {
+            animatePullTo(0f)
+        }
+    }
+
+    private fun animatePullTo(target: Float) {
+        pullSettleAnimator?.cancel()
+        pullSettleAnimator = ValueAnimator.ofFloat(pullOffsetY, target).apply {
+            duration = 200
+            interpolator = DecelerateInterpolator()
+            addUpdateListener {
+                pullOffsetY = it.animatedValue as Float
+                invalidate()
+            }
+            if (target == 0f) {
+                addListener(object : android.animation.AnimatorListenerAdapter() {
+                    override fun onAnimationEnd(animation: android.animation.Animator) {
+                        stopPullSpin()
+                    }
+                })
+            }
+            start()
+        }
+    }
+
+    // Same "own continuous invalidate() loop, started/stopped on demand"
+    // idea as updateSpinnerAnimator() for the "spinner" draw command —
+    // this one drives drawPullToRefreshIndicator()'s rotation instead,
+    // active only while isRefreshing (never for the pull-distance part of
+    // the gesture, which redraws on its own via the drag's own
+    // invalidate() calls).
+    private fun startPullSpin() {
+        if (pullSpinAnimator != null) return
+        pullSpinAnimator = ValueAnimator.ofFloat(0f, 1f).apply {
+            duration = 16
+            repeatCount = ValueAnimator.INFINITE
+            addUpdateListener { invalidate() }
+            start()
+        }
+    }
+
+    private fun stopPullSpin() {
+        pullSpinAnimator?.cancel()
+        pullSpinAnimator = null
     }
 
     // Momentum scrolling: a decelerating ValueAnimator from the release
@@ -1276,6 +1865,7 @@ class NativeCanvasView(context: Context) : View(context) {
 
         handleClientPanelTap(touchX, rawTouchY)
         handleHScrollTap(touchX, rawTouchY)
+        handleVScrollTap(touchX, rawTouchY)
     }
 
     // ClientTabs panels carry their own hitRegions embedded inside
@@ -1290,12 +1880,18 @@ class NativeCanvasView(context: Context) : View(context) {
         for (index in 0 until commands.length()) {
             val command = commands.getJSONObject(index)
             if (command.optString("type") != "clientPanel") continue
-            if (clientTabState[command.getString("key")] != command.getInt("index")) continue
+            val key = command.getString("key")
+            if (clientTabState[key] != command.getInt("index")) continue
 
             val fixed = command.optBoolean("fixed", false)
             val touchY = if (fixed) rawTouchY else rawTouchY + scrollY
             val offsetX = command.getDouble("x")
-            val offsetY = command.getDouble("y")
+            // Mid-slide (BottomSheet opening/closing, or its handle being
+            // dragged), the panel is drawn shifted from its authored (x, y)
+            // — see drawClientPanelCommand()'s identical offset — so a tap
+            // must land against that same shifted position, not where the
+            // sheet will eventually rest.
+            val offsetY = command.getDouble("y") + (sheetAnimatedOffsetY[key] ?: 0f) + if (activeSheetDrag?.key == key) sheetDragOffsetY else 0f
             val nestedRegions = command.getJSONArray("hitRegions")
 
             for (regionIndex in 0 until nestedRegions.length()) {
@@ -1358,12 +1954,75 @@ class NativeCanvasView(context: Context) : View(context) {
         }
     }
 
+    // Vertical counterpart to handleHScrollTap() right above — subtracts
+    // the region's own scroll offset along the Y axis instead of X.
+    private fun handleVScrollTap(touchX: Float, rawTouchY: Float) {
+        for (index in 0 until commands.length()) {
+            val command = commands.getJSONObject(index)
+            if (command.optString("type") != "vScroll") continue
+
+            val fixed = command.optBoolean("fixed", false)
+            val touchY = if (fixed) rawTouchY else rawTouchY + scrollY
+            val viewportX = command.getDouble("x")
+            val viewportY = command.getDouble("y")
+            val viewportWidth = command.getDouble("width")
+            val viewportHeight = command.getDouble("height")
+            if (touchX < viewportX || touchX > viewportX + viewportWidth ||
+                touchY < viewportY || touchY > viewportY + viewportHeight
+            ) continue
+
+            val offset = vScrollOffsets[command.getString("key")] ?: 0f
+            val offsetY = viewportY - offset
+            val nestedRegions = command.getJSONArray("hitRegions")
+
+            for (regionIndex in 0 until nestedRegions.length()) {
+                val region = nestedRegions.getJSONObject(regionIndex)
+                val left = viewportX + region.getDouble("x")
+                val top = offsetY + region.getDouble("y")
+                val right = left + region.getDouble("width")
+                val bottom = top + region.getDouble("height")
+
+                if (touchX >= left && touchX <= right && touchY >= top && touchY <= bottom) {
+                    Log.i("NativeCanvasView", "tap hit region (vScroll): ${region.getString("action")}")
+                    performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
+                    onAction?.invoke(region.getString("action"), RectF(left.toFloat(), top.toFloat(), right.toFloat(), bottom.toFloat()), region.optJSONObject("meta"))
+                    return
+                }
+            }
+        }
+    }
+
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
 
         val previous = previousCommands
 
         val flyingTags = activeHeroFlights.keys
+
+        // Transition offsets (Canvas::setTransition()): additional to the
+        // existing opacity blend, riding the SAME fadeProgress animator
+        // so there's no separate clock. Only non-zero mid-crossfade
+        // (previous != null && fadeProgress < 1f); "fade" (the default)
+        // leaves every offset at 0, i.e. today's plain crossfade.
+        val viewportWidthDp = if (density > 0) width / density else 0f
+        val viewportHeightDp = if (density > 0) height / density else 0f
+        var incomingOffsetX = 0f
+        var outgoingOffsetX = 0f
+        var incomingOffsetY = 0f
+        var outgoingOffsetY = 0f
+        when (transitionType) {
+            "slideLeft" -> {
+                incomingOffsetX = viewportWidthDp * (1f - fadeProgress)
+                outgoingOffsetX = -viewportWidthDp * fadeProgress
+            }
+            "slideRight" -> {
+                incomingOffsetX = -viewportWidthDp * (1f - fadeProgress)
+                outgoingOffsetX = viewportWidthDp * fadeProgress
+            }
+            "slideUp" -> {
+                incomingOffsetY = viewportHeightDp * (1f - fadeProgress)
+            }
+        }
 
         // Scrollable pass: translated by -scrollY, fixed commands excluded.
         // Commands belonging to a tag currently in flight are skipped here
@@ -1373,25 +2032,92 @@ class NativeCanvasView(context: Context) : View(context) {
         canvas.scale(density, density)
         canvas.translate(0f, -scrollY)
         if (previous != null && fadeProgress < 1f) {
+            canvas.save()
+            canvas.translate(outgoingOffsetX, outgoingOffsetY)
             drawCommands(canvas, previous, 1f - fadeProgress, fixed = false, excludeHeroTags = flyingTags)
+            canvas.restore()
         }
+        canvas.save()
+        canvas.translate(incomingOffsetX, incomingOffsetY)
         drawCommands(canvas, commands, fadeProgress, fixed = false, excludeHeroTags = flyingTags)
+        canvas.restore()
         canvas.restoreToCount(savedState)
 
         // Fixed pass: same density scale, no scroll translate — an
         // AppBar/BottomNavigation/Fab painted via Fixed stays pinned
         // to the viewport while the pass above scrolls underneath it.
+        // Slides with the rest of the screen too (a Fixed AppBar rides
+        // along with slideLeft/slideRight, same as any real nav stack).
         savedState = canvas.save()
         canvas.scale(density, density)
         if (previous != null && fadeProgress < 1f) {
+            canvas.save()
+            canvas.translate(outgoingOffsetX, outgoingOffsetY)
             drawCommands(canvas, previous, 1f - fadeProgress, fixed = true, excludeHeroTags = flyingTags)
+            canvas.restore()
         }
+        canvas.save()
+        canvas.translate(incomingOffsetX, incomingOffsetY)
         drawCommands(canvas, commands, fadeProgress, fixed = true, excludeHeroTags = flyingTags)
+        canvas.restore()
         canvas.restoreToCount(savedState)
 
         drawHeroTransition(canvas)
         drawDismissOverlay(canvas)
         drawReorderOverlay(canvas)
+        drawPullToRefreshIndicator(canvas)
+    }
+
+    // A small circular indicator pinned near the top of the viewport —
+    // grows in as pullOffsetY grows (a partial ring, the same visual
+    // language CircularProgress's own determinate arc already uses on
+    // the PHP side, just drawn client-only here since there's nothing
+    // server-rendered to show progress against yet), then spins
+    // continuously once isRefreshing (driven by pullSpinAnimator,
+    // System.currentTimeMillis()-based exactly like drawSpinnerCommand()).
+    // Screen-relative like a Fixed AppBar (no scroll translate) — never
+    // touches the main content's own draw pass at all, so a screen with
+    // no pull-to-refresh registered pays literally zero extra draw cost
+    // (pullOffsetY stays 0, this returns immediately).
+    private fun drawPullToRefreshIndicator(canvas: Canvas) {
+        if (pullOffsetY <= 0f) return
+        val saved = canvas.save()
+        canvas.scale(density, density)
+        val viewportWidthDp = if (density > 0) width / density else 0f
+        val cx = viewportWidthDp / 2f
+        val cy = 12f + pullOffsetY * 0.4f
+        val outerRadius = 14f
+
+        val discPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.WHITE
+            setShadowLayer(6f, 0f, 2f, Color.parseColor("#33000000"))
+        }
+        canvas.drawCircle(cx, cy, outerRadius, discPaint)
+
+        val arcRect = RectF(cx - 9f, cy - 9f, cx + 9f, cy + 9f)
+        val trackPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.STROKE
+            strokeWidth = 2.5f
+            strokeCap = Paint.Cap.ROUND
+            color = Color.parseColor("#E5E7EB")
+        }
+        canvas.drawArc(arcRect, 0f, 360f, false, trackPaint)
+
+        val sweepPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.STROKE
+            strokeWidth = 2.5f
+            strokeCap = Paint.Cap.ROUND
+            color = Color.parseColor("#F97316")
+        }
+        if (isRefreshing) {
+            val periodMs = 900f
+            val rotation = (android.os.SystemClock.uptimeMillis() % periodMs.toLong()) / periodMs * 360f
+            canvas.drawArc(arcRect, rotation, 110f, false, sweepPaint)
+        } else {
+            val progress = (pullOffsetY / pullTriggerDistance).coerceIn(0f, 1f)
+            canvas.drawArc(arcRect, -90f, 360f * progress, false, sweepPaint)
+        }
+        canvas.restoreToCount(saved)
     }
 
     /**
@@ -1513,7 +2239,7 @@ class NativeCanvasView(context: Context) : View(context) {
      * treat as "can't be sure, don't skip/don't shrink the invalidate".
      */
     private fun commandBoundsDp(command: JSONObject): RectF? = when (command.optString("type")) {
-        "rect", "image" -> RectF(
+        "rect", "image", "skeleton" -> RectF(
             command.getDouble("x").toFloat(),
             command.getDouble("y").toFloat(),
             (command.getDouble("x") + command.getDouble("width")).toFloat(),
@@ -1740,10 +2466,22 @@ class NativeCanvasView(context: Context) : View(context) {
 
     private fun drawTextCommand(canvas: Canvas, command: JSONObject, alpha: Float) {
         val bold = command.optBoolean("bold", false)
+        // GoogleFontText (Engine\Native\GoogleFontText) — same "draw with
+        // the fallback now, invalidate() once the real asset resolves"
+        // idiom drawImageCommand() already uses for ImageLoader.
+        val fontFamily = command.optString("fontFamily", "")
+        val typeface = if (fontFamily.isNotEmpty()) {
+            GoogleFontLoader.get(fontFamily) ?: run {
+                GoogleFontLoader.load(context, fontFamily) { invalidate() }
+                robotoTypeface(context, bold)
+            }
+        } else {
+            robotoTypeface(context, bold)
+        }
         val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             color = Color.parseColor(command.optString("color", "#000000"))
             textSize = command.optDouble("size", 16.0).toFloat()
-            typeface = robotoTypeface(context, bold)
+            this.typeface = typeface
             letterSpacing = command.optDouble("letterSpacing", 0.0).toFloat()
             this.alpha = (this.alpha * alpha).toInt()
         }
@@ -1770,7 +2508,11 @@ class NativeCanvasView(context: Context) : View(context) {
         val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             this.color = color
             textSize = size
-            typeface = materialIconsTypeface(context)
+            typeface = if (command.optString("font", "material") == "fontawesome") {
+                fontAwesomeTypeface(context)
+            } else {
+                materialIconsTypeface(context)
+            }
             textAlign = Paint.Align.CENTER
         }
 
@@ -2050,6 +2792,19 @@ class NativeCanvasView(context: Context) : View(context) {
         private fun materialIconsTypeface(context: Context): Typeface {
             return cachedMaterialIconsTypeface ?: Typeface.createFromAsset(context.assets, "fonts/MaterialIcons-Regular.ttf").also {
                 cachedMaterialIconsTypeface = it
+            }
+        }
+
+        @Volatile
+        private var cachedFontAwesomeTypeface: Typeface? = null
+
+        // FontAwesomeIcons (Engine\Native\FontAwesomeIcons) — same glyph-
+        // against-a-bundled-font technique as materialIconsTypeface()
+        // just above, a second font family selected via the icon draw
+        // command's own "font" field (see Icon.php's $font parameter).
+        private fun fontAwesomeTypeface(context: Context): Typeface {
+            return cachedFontAwesomeTypeface ?: Typeface.createFromAsset(context.assets, "fonts/FontAwesome-Solid.ttf").also {
+                cachedFontAwesomeTypeface = it
             }
         }
 
