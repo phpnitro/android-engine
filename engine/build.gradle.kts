@@ -1,16 +1,22 @@
 plugins {
     id("com.android.library")
-    id("org.jetbrains.kotlin.android")
+    // AGP 9.0+ bundles Kotlin support directly (no separate
+    // org.jetbrains.kotlin.android plugin) — see
+    // developer.android.com/build/migrate-to-built-in-kotlin.
     id("maven-publish")
 }
 
 android {
     namespace = "com.phpnitro.engine"
-    compileSdk = 35
+    compileSdk = 36
 
     defaultConfig {
         minSdk = 24
-        targetSdk = 35
+        // No targetSdk here: AGP 9.0+ removed it from a LIBRARY module's
+        // defaultConfig DSL entirely ("Unresolved reference") — it was
+        // always an application-only concept (a consuming app's own
+        // targetSdk is what Play Store checks), vestigial on a library
+        // either way.
     }
 
     publishing {
@@ -34,9 +40,8 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
 
-    kotlinOptions {
-        jvmTarget = "17"
-    }
+    // No kotlinOptions block: built-in Kotlin derives jvmTarget from
+    // compileOptions.targetCompatibility above (17) by default.
 }
 
 // JitPack's own recipe for an Android library (jitpack.io/docs/ANDROID/):
