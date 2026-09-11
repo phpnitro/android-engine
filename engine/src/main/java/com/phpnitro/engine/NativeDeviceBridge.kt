@@ -10,6 +10,7 @@ import android.hardware.camera2.CameraManager
 import android.media.MediaPlayer
 import android.media.MediaRecorder
 import android.net.Uri
+import android.net.wifi.WifiManager
 import android.os.BatteryManager
 import android.os.Build
 import android.os.Handler
@@ -31,6 +32,9 @@ import androidx.fragment.app.FragmentActivity
 import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKey
 import com.google.android.gms.location.LocationServices
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import java.io.File
 
 /**
@@ -90,6 +94,181 @@ class NativeDeviceBridge(private val context: Context) {
         val adapter = (context.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager)?.adapter
             ?: return "unsupported"
         return if (adapter.isEnabled) "on" else "off"
+    }
+
+    /**
+     * Settings.Global.AIRPLANE_MODE_ON — a plain, publicly readable
+     * setting, no permission needed. Read-only on both platforms:
+     * neither Android nor iOS expose a public API to actually TOGGLE
+     * airplane mode from a third-party app (a real OS restriction, not
+     * a narrower implementation here).
+     */
+    fun airplaneModeState(): String {
+        val value = Settings.Global.getInt(context.contentResolver, Settings.Global.AIRPLANE_MODE_ON, 0)
+        return if (value != 0) "on" else "off"
+    }
+
+    /**
+     * "unsupported" | "off" | "on" | "on: <SSID>" — WifiManager.isWifiEnabled
+     * needs only ACCESS_WIFI_STATE (a normal permission, always granted).
+     * The connected network's own SSID additionally needs
+     * ACCESS_FINE_LOCATION (an Android 27+ privacy restriction unrelated
+     * to WiFi itself, already declared for Engine\Device\Geofence) —
+     * same "check, never request" contract every other permission-gated
+     * read in this file follows: falls back to a bare "on" without it,
+     * rather than prompting.
+     */
+    fun wifiState(): String {
+        val wifiManager = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
+            ?: return "unsupported"
+        if (!wifiManager.isWifiEnabled) return "off"
+        if (ActivityCompat.checkSelfPermission(context, android.Manifest.permission.ACCESS_FINE_LOCATION)
+            != PackageManager.PERMISSION_GRANTED
+        ) {
+            return "on"
+        }
+        @Suppress("DEPRECATION")
+        val ssid = wifiManager.connectionInfo?.ssid?.trim('"')
+        return if (ssid.isNullOrEmpty() || ssid == "<unknown ssid>") "on" else "on: $ssid"
+    }
+
+    /**
+     * Best-effort — "isWifiApEnabled"/"getWifiApState" have been hidden
+     * (`@hide`) SDK methods since day one, never part of the public
+     * WifiManager API at any Android version; this only works at all
+     * via reflection, and Android's own hidden-API restrictions
+     * (enforced since API 28, tightened further each release) can
+     * silently block that reflective call depending on OEM/version —
+     * "unsupported" is the honest, expected result on a growing share
+     * of real devices, not a bug in this wrapper. No public,
+     * officially-supported way to read personal-hotspot state exists
+     * on modern Android at all.
+     */
+    fun hotspotState(): String {
+        return try {
+            val wifiManager = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
+                ?: return "unsupported"
+            val method = wifiManager.javaClass.getDeclaredMethod("isWifiApEnabled")
+            method.isAccessible = true
+            if (method.invoke(wifiManager) as? Boolean == true) "on" else "off"
+        } catch (e: Exception) {
+            "unsupported"
+        }
+    }
+
+    /**
+     * WallpaperManager.setBitmap() — SET_WALLPAPER is a normal
+     * permission (always granted, no runtime prompt). Downloads
+     * $imageUrl off the main thread (network + bitmap decode, same
+     * reasoning readSensor()'s own async shape has for anything that
+     * can't finish synchronously) and reports back through onResult on
+     * the main thread.
+     */
+    fun setWallpaper(imageUrl: String, onResult: (String) -> Unit) {
+        val mainHandler = Handler(Looper.getMainLooper())
+        Thread {
+            val result = try {
+                val bitmap = java.net.URL(imageUrl).openStream().use { android.graphics.BitmapFactory.decodeStream(it) }
+                if (bitmap == null) {
+                    "Erreur : image invalide"
+                } else {
+                    android.app.WallpaperManager.getInstance(context).setBitmap(bitmap)
+                    "Fond d'écran modifié"
+                }
+            } catch (e: Exception) {
+                "Erreur : ${e.message}"
+            }
+            mainHandler.post { onResult(result) }
+        }.start()
+    }
+
+    /**
+     * Best-effort — Health Connect is Google's current unified health/
+     * fitness store, itself a separate app most devices don't ship with
+     * pre-installed (SDK_UNAVAILABLE in that case, reported as
+     * "unsupported"). Same "check, never request" contract as
+     * contactsCount()/upcomingEventsCount() above: a permission not yet
+     * granted reports "Permission requise" rather than prompting.
+     * Today's step count via aggregate(), the one metric every Health
+     * Connect-integrated app/watch reliably contributes.
+     */
+    fun healthStepCount(onResult: (String) -> Unit) {
+        // connect-client itself declares minSdk 26 — this project's own
+        // minSdk stays 24 (see AndroidManifest.xml's own
+        // tools:overrideLibrary comment), so nothing below this guard
+        // may ever run on API < 26, keeping that override's "may lead
+        // to runtime failures" warning purely theoretical here.
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
+            onResult("unsupported")
+            return
+        }
+        val mainHandler = Handler(Looper.getMainLooper())
+        CoroutineScope(Dispatchers.IO).launch {
+            val result = try {
+                val status = androidx.health.connect.client.HealthConnectClient.getSdkStatus(context)
+                if (status != androidx.health.connect.client.HealthConnectClient.SDK_AVAILABLE) {
+                    "unsupported"
+                } else {
+                    val client = androidx.health.connect.client.HealthConnectClient.getOrCreate(context)
+                    val permission = androidx.health.connect.client.permission.HealthPermission
+                        .getReadPermission(androidx.health.connect.client.records.StepsRecord::class)
+                    val granted = client.permissionController.getGrantedPermissions()
+                    if (!granted.contains(permission)) {
+                        "Permission requise"
+                    } else {
+                        val now = java.time.Instant.now()
+                        val startOfDay = now.truncatedTo(java.time.temporal.ChronoUnit.DAYS)
+                        val response = client.aggregate(
+                            androidx.health.connect.client.request.AggregateRequest(
+                                metrics = setOf(androidx.health.connect.client.records.StepsRecord.COUNT_TOTAL),
+                                timeRangeFilter = androidx.health.connect.client.time.TimeRangeFilter.between(startOfDay, now),
+                            ),
+                        )
+                        val steps = response[androidx.health.connect.client.records.StepsRecord.COUNT_TOTAL] ?: 0L
+                        "$steps pas aujourd'hui"
+                    }
+                }
+            } catch (e: Exception) {
+                "unsupported"
+            }
+            mainHandler.post { onResult(result) }
+        }
+    }
+
+    /**
+     * Always "unsupported" — Android has no OS-level "Reminders"
+     * concept at all, unlike iOS's own EventKit reminders (EKReminder,
+     * a genuinely separate store from Calendar events). The closest
+     * Android analog (a task list) only exists inside individual third-
+     * party apps (Google Tasks, etc.), each with its own non-standard
+     * API a generic device bridge can't target — a real, permanent
+     * platform gap, not a temporary "not implemented yet".
+     */
+    fun remindersState(): String = "unsupported"
+
+    /**
+     * Best-effort, almost always "unsupported" on a real device —
+     * Telephony.Carriers has required carrier privileges (not just a
+     * runtime permission) to read on Android 10+ for anything beyond
+     * this app's own APN entries, which a generic demo app has none of.
+     * Catches both the SecurityException a normal app gets denied with
+     * and a null/empty cursor the same way, rather than crashing.
+     */
+    fun apnName(): String {
+        return try {
+            val cursor = context.contentResolver.query(
+                android.net.Uri.parse("content://telephony/carriers/preferapn"),
+                arrayOf("apn"),
+                null,
+                null,
+                null,
+            )
+            cursor?.use {
+                if (it.moveToFirst()) it.getString(0) ?: "unsupported" else "unsupported"
+            } ?: "unsupported"
+        } catch (e: Exception) {
+            "unsupported"
+        }
     }
 
     /** Same real ConnectivityManager check WebAppInterface.getConnectionType() uses — the native replacement for Engine\Connectivity\ConnectivityBadge's JS-side navigator.onLine. */

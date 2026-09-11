@@ -870,6 +870,41 @@ class NativeRenderPocActivity : AppCompatActivity() {
                 fieldValues[parts.getOrElse(1) { "bt_out" }] = deviceBridge.bluetoothState()
                 refetch(action = null, includeFields = true)
             }
+            "airplanemode" -> {
+                fieldValues[parts.getOrElse(1) { "airplane_out" }] = deviceBridge.airplaneModeState()
+                refetch(action = null, includeFields = true)
+            }
+            "wifi" -> {
+                fieldValues[parts.getOrElse(1) { "wifi_out" }] = deviceBridge.wifiState()
+                refetch(action = null, includeFields = true)
+            }
+            "hotspot" -> {
+                fieldValues[parts.getOrElse(1) { "hotspot_out" }] = deviceBridge.hotspotState()
+                refetch(action = null, includeFields = true)
+            }
+            "wallpaper" -> {
+                val url = java.net.URLDecoder.decode(parts.getOrElse(1) { "" }, "UTF-8")
+                val outputField = parts.getOrElse(2) { "wallpaper_out" }
+                deviceBridge.setWallpaper(url) { result ->
+                    fieldValues[outputField] = result
+                    refetch(action = null, includeFields = true)
+                }
+            }
+            "health" -> {
+                val outputField = parts.getOrElse(1) { "health_out" }
+                deviceBridge.healthStepCount { result ->
+                    fieldValues[outputField] = result
+                    refetch(action = null, includeFields = true)
+                }
+            }
+            "reminders" -> {
+                fieldValues[parts.getOrElse(1) { "reminders_out" }] = deviceBridge.remindersState()
+                refetch(action = null, includeFields = true)
+            }
+            "apn" -> {
+                fieldValues[parts.getOrElse(1) { "apn_out" }] = deviceBridge.apnName()
+                refetch(action = null, includeFields = true)
+            }
             "securestore" -> {
                 val key = java.net.URLDecoder.decode(parts.getOrElse(1) { "demo_key" }, "UTF-8")
                 val value = java.net.URLDecoder.decode(parts.getOrElse(2) { "" }, "UTF-8")
@@ -1120,6 +1155,21 @@ class NativeRenderPocActivity : AppCompatActivity() {
                 }
                 startActivity(Intent(Intent.ACTION_VIEW, geoUri))
             }
+            // Engine\Device\FilesApp — CATEGORY_APP_FILES is the
+            // documented Android way to jump straight to the system's
+            // default file manager (distinct from OpenFile above, which
+            // opens ONE specific file this app wrote, via a Uri +
+            // FileProvider). Not every OEM ships an app that registers
+            // for this category, hence the try/catch fallback below —
+            // same "no crash, just no-op" contract every other
+            // best-effort capability in this file follows.
+            "filesapp" -> {
+                try {
+                    startActivity(Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_APP_FILES))
+                } catch (e: android.content.ActivityNotFoundException) {
+                    // No app on this device registers for CATEGORY_APP_FILES.
+                }
+            }
             // Engine\Device\FileSaver — MediaStore.Downloads needs API 29+
             // (the scoped-storage way, no WRITE_EXTERNAL_STORAGE
             // permission); minSdk here is 24, hence the version gate.
@@ -1202,6 +1252,14 @@ class NativeRenderPocActivity : AppCompatActivity() {
             "wssend" -> {
                 val message = java.net.URLDecoder.decode(parts.getOrElse(1) { "" }, "UTF-8")
                 webSocketService?.send(message)
+            }
+            "wsjoinroom" -> {
+                val room = java.net.URLDecoder.decode(parts.getOrElse(1) { "" }, "UTF-8")
+                webSocketService?.joinRoom(room)
+            }
+            "wsleaveroom" -> {
+                val room = java.net.URLDecoder.decode(parts.getOrElse(1) { "" }, "UTF-8")
+                webSocketService?.leaveRoom(room)
             }
             "wsdisconnect" -> {
                 webSocketService?.disconnect()
